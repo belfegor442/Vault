@@ -1,0 +1,15 @@
+[package]
+name = "vault-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Atomic crash-safe storage layer for Vault"
+
+[dependencies]
+vault-container = { workspace = true }
+vault-crypto = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,491 @@
+// Vault — native Slint front-end.
+// Screens are toggled with `screen` (0 unlock / 1 main / 2 status).
+
+import { Button, LineEdit, ListView, VerticalBox, HorizontalBox, ScrollView, TextEdit, CheckBox } from "std-widgets.slint";
+
+struct ItemRow {
+    id: string,
+    title: string,
+    subtitle: string,
+    kind: string,
+    favorite: bool,
+}
+
+struct FolderRow {
+    id: string,
+    name: string,
+    count: string,
+}
+
+component ScreenButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: false;
+    in property <bool> danger: false;
+    callback clicked();
+    height: 36px;
+    background: touch.has-hover ? (root.danger ? #4a2430 : #263241) : (root.active ? #22364d : transparent);
+    border-radius: 6px;
+    touch := TouchArea { clicked => { root.clicked(); } }
+    VerticalBox {
+        alignment: center;
+        Text {
+            text: root.label;
+            color: root.danger ? #e57373 : (root.active ? #7cc4ff : #c7d2de);
+            font-size: 13px;
+        }
+    }
+}
+
+component Field inherits VerticalBox {
+    in-out property <string> label;
+    in-out property <string> value <=> edit.text;
+    in property <string> placeholder;
+    in property <bool> password: false;
+    spacing: 3px;
+    Text { text: root.label; color: #8fa1b3; font-size: 11px; }
+    edit := LineEdit {
+        placeholder-text: root.placeholder;
+        input-type: root.password ? InputType.password : InputType.text;
+    }
+}
+
+component UnlockView inherits Rectangle {
+    in-out property <int> mode; // 0 unlock, 1 create, 2 recover
+    in-out property <string> dir-text;
+    in-out property <string> error-text;
+    in-out property <string> pass;
+    in-out property <string> pass-confirm;
+    in-out property <string> rec-key;
+    in-out property <string> rec-pass;
+    in-out property <bool> with-recovery-check;
+    callback unlock-requested(string);
+    callback create-requested(string, string, bool);
+    callback recover-requested(string, string);
+
+    background: #121821;
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 400px;
+        height: root.mode == 2 ? 460px : (root.mode == 1 ? 480px : 350px);
+        background: #1a222d;
+        border-radius: 10px;
+        border-width: 1px;
+        border-color: #2a3644;
+        VerticalBox {
+            padding: 28px;
+            spacing: 10px;
+            Text {
+                text: root.mode == 0 ? "Vault" : (root.mode == 1 ? "Create vault" : "Recover vault");
+                color: #e8eef5;
+                font-size: 26px;
+                font-weight: 700;
+            }
+            Text {
+                text: root.mode == 0 ? "Enter your master password" : (root.mode == 1 ? "Choose a master password (min 8 chars)" : "Use your recovery key and choose a new password");
+                color: #8fa1b3;
+                font-size: 13px;
+            }
+            if root.mode == 0 || root.mode == 1 : Field {
+                label: "Vault directory";
+                value <=> root.dir-text;
+                placeholder: "path to vault folder";
+            }
+            if root.mode == 2 : Field {
+                label: "Recovery key";
+                value <=> root.rec-key;
+                placeholder: "XXXX-XXXX-XXXX-...";
+            }
+            if root.mode == 0 : Field {
+                label: "Master password";
+                value <=> root.pass;
+                placeholder: "password";
+                password: true;
+            }
+            if root.mode == 1 : Field {
+                label: "Master password";
+                value <=> root.pass;
+                placeholder: "min 8 characters";
+                password: true;
+            }
+            if root.mode == 1 : Field {
+                label: "Confirm password";
+                value <=> root.pass-confirm;
+                placeholder: "repeat password";
+                password: true;
+            }
+            if root.mode == 2 : Field {
+                label: "New master password";
+                value <=> root.rec-pass;
+                placeholder: "min 8 characters";
+                password: true;
+            }
+            if root.mode == 1 : CheckBox {
+                text: "Issue a recovery key (shown once)";
+                checked <=> root.with-recovery-check;
+            }
+            if root.error-text != "" : Text {
+                text: root.error-text;
+                color: #e57373;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+            Button {
+                text: root.mode == 0 ? "Unlock" : (root.mode == 1 ? "Create" : "Recover");
+                clicked => {
+                    if (root.mode == 0) { root.unlock-requested(root.pass); }
+                    else if (root.mode == 1) { root.create-requested(root.pass, root.pass-confirm, root.with-recovery-check); }
+                    else { root.recover-requested(root.rec-key, root.rec-pass); }
+                }
+            }
+            HorizontalBox {
+                spacing: 8px;
+                Button {
+                    text: root.mode == 0 ? "Create new vault" : "Back";
+                    clicked => {
+                        root.mode = root.mode == 0 ? 1 : 0;
+                        root.error-text = "";
+                    }
+                }
+                if root.mode == 0 : Button {
+                    text: "Recover";
+                    clicked => {
+                        root.mode = 2;
+                        root.error-text = "";
+                    }
+                }
+            }
+        }
+    }
+}
+
+component ItemLine inherits Rectangle {
+    in property <ItemRow> data;
+    in property <bool> selected: false;
+    callback clicked();
+    min-height: 54px;
+    background: touch.has-hover ? #22303f : (root.selected ? #1f2e40 : transparent);
+    border-radius: 6px;
+    touch := TouchArea { clicked => { root.clicked(); } }
+    HorizontalBox {
+        padding: 8px;
+        spacing: 10px;
+        Rectangle {
+            width: 34px;
+            height: 34px;
+            y: (parent.height - self.height) / 2;
+            border-radius: 17px;
+            background: root.data.kind == "password" ? #3d2f55 : (root.data.kind == "note" ? #1f4030 : #40331f);
+            Text {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                text: root.data.kind == "password" ? "P" : (root.data.kind == "note" ? "N" : "F");
+                color: #c7d2de;
+                font-size: 14px;
+                font-weight: 700;
+            }
+        }
+        VerticalBox {
+            spacing: 2px;
+            HorizontalBox {
+                Text {
+                    text: root.data.title;
+                    color: #e8eef5;
+                    font-size: 14px;
+                    overflow: elide;
+                }
+                if root.data.favorite : Text {
+                    text: "★";
+                    color: #f0c674;
+                    font-size: 13px;
+                }
+            }
+            Text {
+                text: root.data.subtitle;
+                color: #7d8fa3;
+                font-size: 11px;
+                overflow: elide;
+            }
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "Vault";
+    preferred-width: 1180px;
+    preferred-height: 760px;
+    min-width: 940px;
+    min-height: 620px;
+    background: #121821;
+
+    // screen / auth
+    in-out property <int> screen; // 0 unlock, 1 main, 2 status
+    in-out property <int> auth-mode;
+    in-out property <string> error-text;
+    in-out property <string> notice;
+    in-out property <string> dir-text;
+    // auth fields
+    in-out property <string> pass;
+    in-out property <string> pass-confirm;
+    in-out property <string> rec-key;
+    in-out property <string> rec-pass;
+    in-out property <bool> with-recovery-check;
+    // data
+    in property <[ItemRow]> items;
+    in property <[FolderRow]> folders;
+    in-out property <int> filter; // 0 all,1 note,2 password,3 file,4 fav
+    in-out property <string> folder-filter;
+    in-out property <string> search-text;
+    in-out property <string> status-text;
+    // detail pane
+    in-out property <int> detail-mode; // 0 none,1 note,2 pw,3 file,4 new-note,5 new-pw,6 import
+    in-out property <string> detail-id;
+    in-out property <string> detail-title;
+    in-out property <string> detail-content;
+    in-out property <string> detail-username;
+    in-out property <string> detail-secret;
+    in-out property <string> detail-url;
+    in-out property <string> detail-category;
+    in-out property <string> detail-notes;
+    in-out property <bool> detail-favorite;
+    in-out property <string> detail-size;
+    in-out property <string> export-path;
+    in-out property <string> import-path;
+    in-out property <string> new-folder-name;
+    selected-index: -1;
+    in-out property <int> selected-index;
+
+    // callbacks
+    callback unlock-requested(string);
+    callback create-requested(string, string, bool);
+    callback recover-requested(string, string);
+    callback lock-requested();
+    callback open-status-requested();
+    callback back-requested();
+    callback refresh-requested();
+    callback filter-changed(int);
+    callback folder-changed(string);
+    callback search-requested(string);
+    callback select-item(int);
+    callback new-item(int); // 1 note, 2 password, 3 import
+    callback save-requested();
+    callback delete-requested();
+    callback favorite-requested();
+    callback export-requested(string);
+    callback import-requested(string);
+    callback new-folder-requested(string);
+    callback verify-requested();
+    callback ack-requested();
+
+    if root.screen == 0 : UnlockView {
+        mode <=> root.auth-mode;
+        dir-text <=> root.dir-text;
+        error-text <=> root.error-text;
+        pass <=> root.pass;
+        pass-confirm <=> root.pass-confirm;
+        rec-key <=> root.rec-key;
+        rec-pass <=> root.rec-pass;
+        with-recovery-check <=> root.with-recovery-check;
+        unlock-requested(pw) => { root.unlock-requested(pw); }
+        create-requested(pw, confirm, with-recovery) => { root.create-requested(pw, confirm, with-recovery); }
+        recover-requested(key, new-pass) => { root.recover-requested(key, new-pass); }
+    }
+
+    if root.screen == 1 : Rectangle {
+        background: #121821;
+        HorizontalBox {
+            padding: 10px;
+            spacing: 10px;
+
+            // ---------------- sidebar
+            Rectangle {
+                width: 210px;
+                background: #171f29;
+                border-radius: 8px;
+                VerticalBox {
+                    padding: 12px;
+                    spacing: 6px;
+                    Text { text: "Vault"; color: #e8eef5; font-size: 20px; font-weight: 700; }
+                    ScreenButton { label: "All items"; active: root.filter == 0 && root.folder-filter == ""; clicked => { root.filter-changed(0); } }
+                    ScreenButton { label: "Notes"; active: root.filter == 1; clicked => { root.filter-changed(1); } }
+                    ScreenButton { label: "Passwords"; active: root.filter == 2; clicked => { root.filter-changed(2); } }
+                    ScreenButton { label: "Files"; active: root.filter == 3; clicked => { root.filter-changed(3); } }
+                    ScreenButton { label: "Favorites"; active: root.filter == 4; clicked => { root.filter-changed(4); } }
+                    Text { text: "FOLDERS"; color: #5f7185; font-size: 10px; }
+                    for f in root.folders : Rectangle {
+                        height: 30px;
+                        border-radius: 5px;
+                        background: ft.has-hover ? #22303f : (root.folder-filter == f.id ? #1f2e40 : transparent);
+                        ft := TouchArea { clicked => { root.folder-changed(f.id); } }
+                        HorizontalBox {
+                            padding-left: 6px;
+                            padding-right: 6px;
+                            Text { text: f.name; color: #c7d2de; font-size: 12px; overflow: elide; }
+                            Text { text: f.count; color: #5f7185; font-size: 11px; }
+                        }
+                    }
+                    HorizontalBox {
+                        spacing: 4px;
+                        LineEdit {
+                            placeholder-text: "new folder";
+                            text <=> root.new-folder-name;
+                        }
+                        Button { text: "+"; clicked => { root.new-folder-requested(root.new-folder-name); } }
+                    }
+                    Rectangle { }
+                    ScreenButton { label: "Status / security"; clicked => { root.open-status-requested(); } }
+                    ScreenButton { label: "Lock"; danger: true; clicked => { root.lock-requested(); } }
+                    Text {
+                        text: root.dir-text;
+                        color: #5f7185;
+                        font-size: 10px;
+                        overflow: elide;
+                    }
+                }
+            }
+
+            // ---------------- list column
+            VerticalBox {
+                spacing: 8px;
+                HorizontalBox {
+                    spacing: 6px;
+                    LineEdit {
+                        placeholder-text: "search (decrypts in memory)…";
+                        text <=> root.search-text;
+                        accepted => { root.search-requested(root.search-text); }
+                    }
+                    Button { text: "Search"; clicked => { root.search-requested(root.search-text); } }
+                    Button { text: "New note"; clicked => { root.new-item(1); } }
+                    Button { text: "New password"; clicked => { root.new-item(2); } }
+                    Button { text: "Import"; clicked => { root.new-item(3); } }
+                }
+                if root.notice != "" : Rectangle {
+                    height: 34px;
+                    background: #1f3a2a;
+                    border-radius: 6px;
+                    VerticalBox {
+                        alignment: center;
+                        padding-left: 10px;
+                        Text { text: root.notice; color: #8fd6a8; font-size: 12px; wrap: word-wrap; }
+                    }
+                }
+                Rectangle {
+                    background: #171f29;
+                    border-radius: 8px;
+                    ListView {
+                        for item[i] in root.items : ItemLine {
+                            data: item;
+                            selected: i == root.selected-index;
+                            clicked => { root.select-item(i); }
+                        }
+                    }
+                }
+            }
+
+            // ---------------- detail pane
+            Rectangle {
+                width: 380px;
+                background: #171f29;
+                border-radius: 8px;
+                VerticalBox {
+                    padding: 14px;
+                    spacing: 8px;
+
+                    if root.detail-mode == 0 : Text {
+                        text: "Select an item";
+                        color: #5f7185;
+                        font-size: 13px;
+                    }
+
+                    if root.detail-mode == 1 || root.detail-mode == 4 : VerticalBox {
+                        spacing: 8px;
+                        Text { text: root.detail-mode == 4 ? "New note" : "Note"; color: #8fa1b3; font-size: 11px; }
+                        LineEdit { placeholder-text: "title"; text <=> root.detail-title; }
+                        TextEdit { text <=> root.detail-content; min-height: 220px; }
+                        HorizontalBox {
+                            spacing: 6px;
+                            Button { text: "Save"; clicked => { root.save-requested(); } }
+                            if root.detail-mode == 1 : Button { text: root.detail-favorite ? "Unfavorite" : "Favorite"; clicked => { root.favorite-requested(); } }
+                            if root.detail-mode == 1 : Button { text: "Delete"; clicked => { root.delete-requested(); } }
+                        }
+                    }
+
+                    if root.detail-mode == 2 || root.detail-mode == 5 : VerticalBox {
+                        spacing: 8px;
+                        Text { text: root.detail-mode == 5 ? "New password entry" : "Password entry"; color: #8fa1b3; font-size: 11px; }
+                        LineEdit { placeholder-text: "name"; text <=> root.detail-title; }
+                        LineEdit { placeholder-text: "username"; text <=> root.detail-username; }
+                        LineEdit {
+                            placeholder-text: "password";
+                            text <=> root.detail-secret;
+                            input-type: InputType.password;
+                        }
+                        LineEdit { placeholder-text: "url"; text <=> root.detail-url; }
+                        LineEdit { placeholder-text: "category"; text <=> root.detail-category; }
+                        TextEdit { placeholder-text: "notes"; text <=> root.detail-notes; min-height: 100px; }
+                        HorizontalBox {
+                            spacing: 6px;
+                            Button { text: "Save"; clicked => { root.save-requested(); } }
+                            if root.detail-mode == 2 : Button { text: root.detail-favorite ? "Unfavorite" : "Favorite"; clicked => { root.favorite-requested(); } }
+                            if root.detail-mode == 2 : Button { text: "Delete"; clicked => { root.delete-requested(); } }
+                        }
+                    }
+
+                    if root.detail-mode == 3 : VerticalBox {
+                        spacing: 8px;
+                        Text { text: "File"; color: #8fa1b3; font-size: 11px; }
+                        Text { text: root.detail-title; color: #e8eef5; font-size: 16px; font-weight: 600; wrap: word-wrap; }
+                        Text { text: root.detail-size; color: #7d8fa3; font-size: 12px; }
+                        LineEdit { placeholder-text: "export to path"; text <=> root.export-path; }
+                        HorizontalBox {
+                            spacing: 6px;
+                            Button { text: "Export"; clicked => { root.export-requested(root.export-path); } }
+                            Button { text: "Delete"; clicked => { root.delete-requested(); } }
+                        }
+                    }
+
+                    if root.detail-mode == 6 : VerticalBox {
+                        spacing: 8px;
+                        Text { text: "Import file"; color: #8fa1b3; font-size: 11px; }
+                        LineEdit { placeholder-text: "path to file"; text <=> root.import-path; }
+                        Button { text: "Import"; clicked => { root.import-requested(root.import-path); } }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.screen == 2 : Rectangle {
+        background: #121821;
+        VerticalBox {
+            padding: 18px;
+            spacing: 10px;
+            HorizontalBox {
+                Text { text: "Status & security"; color: #e8eef5; font-size: 22px; font-weight: 700; }
+                Button { text: "Back"; clicked => { root.back-requested(); } }
+            }
+            if root.notice != "" : Text { text: root.notice; color: #8fd6a8; font-size: 13px; wrap: word-wrap; }
+            Rectangle {
+                background: #171f29;
+                border-radius: 8px;
+                ScrollView {
+                    VerticalBox {
+                        padding: 14px;
+                        spacing: 6px;
+                        Text {
+                            text: root.status-text;
+                            color: #c7d2de;
+                            font-size: 13px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+            HorizontalBox {
+                spacing: 8px;
+                Button { text: "Verify integrity (deep)"; clicked => { root.verify-requested(); } }
+                Button { text: "Acknowledge findings"; clicked => { root.ack-requested(); } }
+            }
+        }
+    }
+}

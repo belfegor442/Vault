@@ -1,0 +1,19 @@
+[package]
+name = "vault-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Vault command line interface (headless engine access)"
+
+[[bin]]
+name = "vault-cli"
+path = "src/main.rs"
+
+[dependencies]
+vault-core = { workspace = true }
+vault-crypto = { workspace = true }
+vault-container = { workspace = true }
+rpassword = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

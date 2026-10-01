@@ -1,5 +1,15 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Node (legacy Electron reference app)
 node_modules/
 dist/
 release/
 *.log
 .DS_Store
+
+# IDE
+.idea/
+.vscode/

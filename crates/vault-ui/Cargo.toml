@@ -1,0 +1,23 @@
+[package]
+name = "vault-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Vault native Slint user interface"
+
+[[bin]]
+name = "vault-ui"
+path = "src/main.rs"
+
+[dependencies]
+vault-core = { workspace = true }
+vault-crypto = { workspace = true }
+vault-container = { workspace = true }
+vault-security = { workspace = true }
+vault-recovery = { workspace = true }
+rand = { workspace = true }
+zeroize = { workspace = true }
+slint = "1"
+
+[build-dependencies]
+slint-build = "1"

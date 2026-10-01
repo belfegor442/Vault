@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vault-crypto",
+    "crates/vault-container",
+    "crates/vault-storage",
+    "crates/vault-security",
+    "crates/vault-recovery",
+    "crates/vault-core",
+    "crates/vault-cli",
+    "crates/vault-ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["belfegor442"]
+
+[workspace.dependencies]
+vault-crypto = { path = "crates/vault-crypto" }
+vault-container = { path = "crates/vault-container" }
+vault-storage = { path = "crates/vault-storage" }
+vault-security = { path = "crates/vault-security" }
+vault-recovery = { path = "crates/vault-recovery" }
+vault-core = { path = "crates/vault-core" }
+
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+base64 = "0.22"
+tempfile = "3"
+rpassword = "7"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
