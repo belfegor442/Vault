@@ -49,7 +49,7 @@ against the real binary.
 | F-5 No mlock/VirtualLock — unlocked keys may reach swap | Medium | Documented; out of scope pre-1.0 |
 | F-6 Recovery capability is destroyed by a domain rekey | Info | By design; audited + documented |
 | F-7 `control.unavailable` resets the rollback witness on first load | Low | Accepted; warning + audit event recorded |
-| F-8 Slint UI layer not yet adversarially reviewed | — | Pending (see roadmap) |
+| F-8 Slint UI layer not yet adversarially reviewed | — | Pending (pre-1.0 review; no roadmap file exists yet) |
 | F-9 `Lockdown::escalate_critical` has no UI/CLI wiring — CRITICAL is unreachable without code changes | Info | Accepted for now; wiring an explicit "declare compromised" surface is pre-1.0 work |
 | F-10 Recovery envelope has no checksum outside the AEAD (garbage key = generic failure) | Info | Accepted; single error class is deliberate (no oracle), format frozen |
 | F-11 Lockdown event log is an in-memory ring (512 events); older entries age out | Info | Accepted; the hash-chained `audit.bin` is the durable record (64 MiB cap) |
