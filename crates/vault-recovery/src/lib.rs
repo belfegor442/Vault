@@ -85,6 +85,12 @@ impl RecoveryKey {
 
     /// Strictly parse a display-form recovery key.
     pub fn from_display(s: &str) -> Result<Self, CryptoError> {
+        // A valid display form is ~50 chars (44 base64 + group dashes);
+        // reject pathological inputs (e.g. megabyte pastes) before the
+        // filter/collect below allocates anything.
+        if s.len() > 1024 {
+            return Err(CryptoError::Malformed("recovery key has invalid length"));
+        }
         let cleaned: String = s
             .chars()
             .filter(|c| *c != '-' && !c.is_whitespace())

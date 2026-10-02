@@ -307,7 +307,17 @@ fn build_status(ui: &MainWindow, st: &Rc<RefCell<Inner>>) {
         r.object_count,
         if r.integrity_ok { "ok" } else { "SUSPECT" }
     ));
-    out.push_str(&format!("Findings acknowledged: {}\n", "see lockdown state"));
+    let findings = engine.lockdown_events();
+    out.push_str(&format!("Lockdown findings: {}\n", findings.len()));
+    if let Some(last) = findings.last() {
+        out.push_str(&format!(
+            "  last: {} [{:?}] {} — {}\n",
+            fmt_ms(last.timestamp_ms),
+            last.severity,
+            last.rule,
+            last.detail
+        ));
+    }
     out.push_str("\nRecent audit events (newest first):\n");
     for e in r.recent_events.iter().rev().take(20) {
         out.push_str(&format!(
