@@ -12,9 +12,11 @@
 ## How it works
 
 The recovery key derives a recovery KEK (`HKDF-SHA256`,
-label `vault:recovery-kek:v1`, context `vault_id`) and unwraps the **same**
-root envelope slot — it is a second way to obtain the root key, not a
-separate data key.
+label `vault:recovery-kek:v1`, context `vault_id || recovery_salt`) and
+unwraps the **same** root envelope slot — it is a second way to obtain the
+root key, not a separate data key. Binding the salt into the KDF context
+ties the envelope to this exact recovery key, so a stolen *old* recovery
+key cannot unwrap a re-issued envelope.
 
 The recovery envelope's AAD is only `hdr[0..28)` (magic, versions,
 vault_id), deliberately excluding the KDF/root-envelope/flags region so:

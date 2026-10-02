@@ -46,6 +46,12 @@ pub struct ControlState {
     /// commit (or a successful heal at next unlock).
     #[serde(default)]
     pub pending_commit: bool,
+    /// Audit-chain anchor: number of records this witness has seen. A log
+    /// with *fewer* records than the anchor has been truncated (suffix
+    /// removal) and must raise `audit.chain_broken`. Lag (anchor < actual)
+    /// is allowed: it only heals forward on the next save.
+    #[serde(default)]
+    pub audit_records: u64,
 }
 
 impl ControlState {
@@ -61,6 +67,7 @@ impl ControlState {
             capability: CAPABILITY_DEGRADED.to_string(),
             updated_ms: now_ms,
             pending_commit: false,
+            audit_records: 0,
         }
     }
 

@@ -35,7 +35,8 @@ use vault_container::{
 use vault_crypto::{DomainKeys, KdfParams, Key32, SecretBytes, Sha256Writer};
 use vault_recovery::RecoveryKey;
 use vault_security::{
-    probe_capabilities, ControlState, Lockdown, PlatformCapability, Trigger, VaultState,
+    probe_capabilities, Action, ControlState, Lockdown, LockdownRecord, PlatformCapability,
+    Trigger, VaultState,
 };
 use vault_storage::{atomic_write, atomic_write_from, cleanup_temp_files, fault_point};
 
@@ -48,6 +49,16 @@ const MAX_INLINE_READ: u64 = 64 * 1024 * 1024; // 64 MiB cap for note/text reads
 const MAX_ATTEMPTS_BEFORE_LOCKOUT: u32 = 5;
 const BASE_LOCKOUT_MS: u64 = 300_000;
 const MAX_LOCKOUT_MS: u64 = 3_600_000;
+
+/// Lockout delay for a failed-attempt count: 5 m · 2^(n−5), capped at 1 h.
+/// Returns `None` while the count is still below the lockout threshold.
+fn lockout_delay_ms(failed_attempts: u32) -> Option<u64> {
+    let steps = failed_attempts.checked_sub(MAX_ATTEMPTS_BEFORE_LOCKOUT)?;
+    // Exponent capped at 6 so the 1 h cap (not the exponent) governs; the
+    // uncapped shift would overflow well before a realistic attempt count.
+    let backoff = BASE_LOCKOUT_MS.saturating_mul(1u64 << steps.min(6));
+    Some(backoff.min(MAX_LOCKOUT_MS))
+}
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -86,6 +97,32 @@ fn mime_for_name(name: &str) -> String {
 
 fn is_text_mime(m: &str) -> bool {
     m.starts_with("text/") || m == "application/json" || m == "application/xml"
+}
+
+/// Write sink that hashes without retaining data: verification needs the
+/// plaintext's SHA-256 and length, never the plaintext itself. Keeps deep
+/// verify / heal memory bounded at O(1) regardless of object size.
+struct HashingSink {
+    hasher: Sha256Writer,
+    len: u64,
+}
+
+impl HashingSink {
+    fn new() -> Self {
+        Self { hasher: Sha256Writer::new(), len: 0 }
+    }
+}
+
+impl Write for HashingSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.hasher.update(buf);
+        self.len += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -218,21 +255,32 @@ impl VaultEngine {
         let vault_id = header.vault_id;
 
         let binary_hash = vault_security::platform::current_binary_hash().unwrap_or([0u8; 32]);
-        let mut lockdown = Lockdown::new();
+        // Restore persisted lockdown state so a fresh process cannot reset it
+        // by simply restarting (state lives in `state/lockdown.json`).
+        let lockdown = std::fs::read(layout.lockdown_file())
+            .ok()
+            .and_then(|b| serde_json::from_slice::<LockdownRecord>(&b).ok())
+            .map(Lockdown::from_record)
+            .unwrap_or_default();
+
+        let mut pending_events: Vec<(u64, String, String, String, String)> = Vec::new();
         let control = match ControlState::load(&layout.control_file(), &vault_id) {
             Ok(Some(c)) => c,
-            Ok(None) => ControlState::new(&vault_crypto::to_hex16(&vault_id), now_ms(), &vault_crypto::to_hex(&binary_hash)),
-            Err(_) => {
-                lockdown.evaluate(
-                    Trigger::new(
-                        "control.unavailable",
-                        60,
-                        vault_security::Severity::Warning,
-                        "control",
-                        "control state unreadable; throttle/rollback witness reset",
-                    ),
+            res => {
+                // A missing control file is just as much a lost witness as an
+                // unreadable one: both reset throttle/rollback evidence and
+                // must be raised (previously `Ok(None)` silently continued).
+                let detail = match res {
+                    Ok(_) => "control state missing; throttle/rollback witness reset",
+                    Err(_) => "control state unreadable; throttle/rollback witness reset",
+                };
+                pending_events.push((
                     now_ms(),
-                );
+                    "control.unavailable".into(),
+                    "control".into(),
+                    "fail".into(),
+                    detail.into(),
+                ));
                 ControlState::new(&vault_crypto::to_hex16(&vault_id), now_ms(), &vault_crypto::to_hex(&binary_hash))
             }
         };
@@ -242,7 +290,53 @@ impl VaultEngine {
         if !control.binary_hash.is_empty()
             && control.binary_hash != vault_crypto::to_hex(&binary_hash)
         {
-            lockdown.evaluate(
+            pending_events.push((
+                now_ms(),
+                "binary.modified".into(),
+                "platform".into(),
+                "warn".into(),
+                "executable hash changed since last trusted launch".into(),
+            ));
+        }
+
+        let capability = if control.capability == vault_security::CAPABILITY_DPAPI {
+            PlatformCapability::Dpapi
+        } else {
+            PlatformCapability::DpapiUnavailable
+        };
+        let control_degraded = pending_events
+            .iter()
+            .any(|(_, ev, ..)| ev == "control.unavailable");
+        let binary_changed = pending_events
+            .iter()
+            .any(|(_, ev, ..)| ev == "binary.modified");
+
+        let mut engine = Self {
+            layout,
+            header,
+            control,
+            capability,
+            lockdown,
+            binary_hash,
+            session: None,
+            manifest: None,
+            audit: None,
+            pending_events,
+        };
+        if control_degraded {
+            engine.eval_trigger(
+                Trigger::new(
+                    "control.unavailable",
+                    60,
+                    vault_security::Severity::Warning,
+                    "control",
+                    "control state missing or unreadable; throttle/rollback witness reset",
+                ),
+                now_ms(),
+            );
+        }
+        if binary_changed {
+            engine.eval_trigger(
                 Trigger::new(
                     "binary.modified",
                     70,
@@ -253,25 +347,7 @@ impl VaultEngine {
                 now_ms(),
             );
         }
-
-        let capability = if control.capability == vault_security::CAPABILITY_DPAPI {
-            PlatformCapability::Dpapi
-        } else {
-            PlatformCapability::DpapiUnavailable
-        };
-
-        Ok(Self {
-            layout,
-            header,
-            control,
-            capability,
-            lockdown,
-            binary_hash,
-            session: None,
-            manifest: None,
-            audit: None,
-            pending_events: Vec::new(),
-        })
+        Ok(engine)
     }
 
     // --------------------------------------------------------------- status
@@ -381,13 +457,24 @@ impl VaultEngine {
         self.control.max_seen_generation = generation;
         self.control.seen_manifest_hash = vault_crypto::to_hex(&cur_hash);
         self.control.binary_hash = vault_crypto::to_hex(&self.binary_hash);
-        let _ = self.control.save(&self.layout.control_file(), &vault_id);
+        if let Err(e) = self.control.save(&self.layout.control_file(), &vault_id) {
+            self.eval_trigger(
+                Trigger::new(
+                    "control.unavailable",
+                    70,
+                    vault_security::Severity::Error,
+                    "control",
+                    format!("failed to persist control state: {e}"),
+                ),
+                now,
+            );
+        }
 
         // Quarantine-and-restart failures are already reflected in the
         // lockdown record; unlock must not fail because of them.
         let _ = self.open_audit();
-        let _ = self.flush_pending_events();
         self.lockdown.on_successful_auth(now);
+        self.save_lockdown();
 
         // Crash debris housekeeping (runs only while unlocked & verified).
         if let Err(e) = self.collect_garbage() {
@@ -401,20 +488,22 @@ impl VaultEngine {
             }
         }
 
+        // Flush events recorded while locked (binary.modified,
+        // control.unavailable, GC orphans) after housekeeping so the log is
+        // open and every pending event lands in one pass.
+        let _ = self.flush_pending_events();
+
         self.audit_event("vault.unlock", "auth", "ok", "")?;
         Ok(())
     }
 
     fn register_failed_attempt(&mut self, now: u64) -> Option<u64> {
         self.control.failed_attempts = self.control.failed_attempts.saturating_add(1);
-        if self.control.failed_attempts >= MAX_ATTEMPTS_BEFORE_LOCKOUT {
-            let steps = self.control.failed_attempts - MAX_ATTEMPTS_BEFORE_LOCKOUT;
-            let backoff = BASE_LOCKOUT_MS.saturating_mul(1u64 << steps.min(3));
-            let backoff = backoff.min(MAX_LOCKOUT_MS);
+        if let Some(backoff) = lockout_delay_ms(self.control.failed_attempts) {
             self.control.lockout_until_ms = now + backoff;
         }
         if self.control.failed_attempts.is_multiple_of(MAX_ATTEMPTS_BEFORE_LOCKOUT) {
-            self.lockdown.evaluate(
+            self.eval_trigger(
                 Trigger::new(
                     "auth.repeated_failure",
                     70,
@@ -425,7 +514,18 @@ impl VaultEngine {
                 now,
             );
         }
-        let _ = self.control.save(&self.layout.control_file(), &self.header.vault_id);
+        if let Err(e) = self.control.save(&self.layout.control_file(), &self.header.vault_id) {
+            self.eval_trigger(
+                Trigger::new(
+                    "control.unavailable",
+                    70,
+                    vault_security::Severity::Error,
+                    "control",
+                    format!("failed to persist attempt counter: {e}"),
+                ),
+                now,
+            );
+        }
         self.control
             .lockout_until_ms
             .checked_sub(now)
@@ -453,10 +553,34 @@ impl VaultEngine {
 
     fn require_writable(&self) -> Result<&Session, CoreError> {
         let s = self.session()?;
-        if matches!(self.lockdown.state(), VaultState::Restricted | VaultState::Critical) {
+        // Writes are allowed only in NORMAL/SUSPICIOUS. LOCKED previously
+        // slipped through (only Restricted/Critical were checked), letting
+        // mutations run while the vault was supposed to require re-auth.
+        if !matches!(
+            self.lockdown.state(),
+            VaultState::Normal | VaultState::Suspicious
+        ) {
             return Err(CoreError::Refused("lockdown policy blocks writes"));
         }
         Ok(s)
+    }
+
+    /// Evaluate a lockdown trigger, apply the resulting action, and persist
+    /// the lockdown record (so a restart cannot reset the state machine).
+    /// `Action::DestroySession` drops the in-memory session immediately.
+    fn eval_trigger(&mut self, trigger: Trigger, now: u64) -> Action {
+        let action = self.lockdown.evaluate(trigger, now);
+        if matches!(action, Action::DestroySession) && self.session.is_some() {
+            self.lock(LockReason::Tamper);
+        }
+        self.save_lockdown();
+        action
+    }
+
+    fn save_lockdown(&self) {
+        if let Ok(json) = serde_json::to_vec(self.lockdown.record()) {
+            let _ = vault_storage::atomic_write(&self.layout.lockdown_file(), &json);
+        }
     }
 
     fn manifest(&self) -> Result<&Manifest, CoreError> {
@@ -475,10 +599,43 @@ impl VaultEngine {
         let vault_id = self.header.vault_id;
         let cur_bytes = vault_storage::read_file_capped(&self.layout.current(), 4096)?;
         let (generation, cur_hash) = decode_current(&cur_bytes)?;
+
+        // Same-generation witness: `CURRENT` must keep pointing at the exact
+        // manifest whose hash was witnessed for this generation. A different
+        // hash at the same generation means the manifest was rewritten after
+        // being witnessed — raise the rollback evidence. The read continues
+        // (the manifest is still verified against `CURRENT`, the chain and the
+        // vault id below): failing hard here would permanently brick a vault
+        // touched by a second concurrent writer, and forging a *self-
+        // consistent* manifest at the witnessed generation requires the meta
+        // key anyway. The witness re-anchors to the observed pair so the
+        // alert does not repeat on every unlock.
+        if generation == self.control.max_seen_generation
+            && !self.control.seen_manifest_hash.is_empty()
+            && vault_crypto::to_hex(&cur_hash) != self.control.seen_manifest_hash
+        {
+            self.eval_trigger(
+                Trigger::new(
+                    "rollback.detected",
+                    95,
+                    vault_security::Severity::Critical,
+                    "control",
+                    format!(
+                        "manifest for generation {} does not match witnessed hash; re-anchoring",
+                        generation
+                    ),
+                ),
+                now,
+            );
+            self.control.seen_manifest_hash = vault_crypto::to_hex(&cur_hash);
+            let vid = self.header.vault_id;
+            let _ = self.control.save(&self.layout.control_file(), &vid);
+        }
+
         let manifest_path = self.layout.manifest_file(generation);
         let manifest_bytes = vault_storage::read_file_capped(&manifest_path, 512 * 1024 * 1024)?;
         if manifest_hash(&manifest_bytes) != cur_hash {
-            self.lockdown.evaluate(
+            self.eval_trigger(
                 Trigger::new(
                     "manifest.auth_failed",
                     100,
@@ -491,7 +648,7 @@ impl VaultEngine {
             return Err(CoreError::Integrity("manifest hash mismatch"));
         }
         if Manifest::peek_vault_id(&manifest_bytes)? != vault_id {
-            self.lockdown.evaluate(
+            self.eval_trigger(
                 Trigger::new(
                     "vault_id.mismatch",
                     100,
@@ -511,7 +668,7 @@ impl VaultEngine {
                 })?;
             let claimed_prev = Manifest::peek_prev_manifest_hash(&manifest_bytes)?;
             if claimed_prev != manifest_hash(&prev_bytes) {
-                self.lockdown.evaluate(
+                self.eval_trigger(
                     Trigger::new(
                         "manifest.auth_failed",
                         95,
@@ -527,7 +684,7 @@ impl VaultEngine {
 
         // ---- rollback witness ----
         if generation < self.control.max_seen_generation {
-            self.lockdown.evaluate(
+            self.eval_trigger(
                 Trigger::new(
                     "rollback.detected",
                     95,
@@ -553,6 +710,34 @@ impl VaultEngine {
         let path = self.layout.audit_file();
         match AuditLog::open(&path, key.clone()) {
             Ok(log) => {
+                // Record-count anchor: suffix removal of whole records is
+                // invisible to the chain itself (see docs/security-audit.md),
+                // so compare against the witness in control state. Lag
+                // (anchor < actual, crash between append and witness save)
+                // heals forward silently; only a *shrink* raises the alarm.
+                let count = log.record_count();
+                if self.control.audit_records > count {
+                    self.eval_trigger(
+                        Trigger::new(
+                            "audit.chain_broken",
+                            85,
+                            vault_security::Severity::Error,
+                            "audit",
+                            format!(
+                                "audit log truncated: witness has {} records, found {}",
+                                self.control.audit_records, count
+                            ),
+                        ),
+                        now_ms(),
+                    );
+                    self.control.audit_records = count;
+                    let vid = self.header.vault_id;
+                    let _ = self.control.save(&self.layout.control_file(), &vid);
+                } else if count > self.control.audit_records {
+                    self.control.audit_records = count;
+                    let vid = self.header.vault_id;
+                    let _ = self.control.save(&self.layout.control_file(), &vid);
+                }
                 self.audit = Some(log);
                 Ok(())
             }
@@ -563,7 +748,7 @@ impl VaultEngine {
                     .audit_dir()
                     .join(format!("audit.bin.corrupt-{}", now_ms()));
                 let _ = std::fs::rename(&path, &quarantine);
-                self.lockdown.evaluate(
+                self.eval_trigger(
                     Trigger::new(
                         "audit.chain_broken",
                         85,
@@ -573,6 +758,9 @@ impl VaultEngine {
                     ),
                     now_ms(),
                 );
+                // Fresh log starts at 0 records; drop the stale anchor so the
+                // quarantine itself is not re-reported at the next open.
+                self.control.audit_records = 0;
                 let fresh = AuditLog::open(&path, key)?;
                 self.audit = Some(fresh);
                 Err(e)
@@ -584,6 +772,7 @@ impl VaultEngine {
         match self.audit.as_mut() {
             Some(a) => {
                 a.append(now_ms(), event, component, result, detail)?;
+                self.control.audit_records = a.record_count();
                 Ok(())
             }
             None => {
@@ -605,17 +794,28 @@ impl VaultEngine {
             for (ts, ev, comp, res, det) in pending {
                 let _ = a.append(ts, &ev, &comp, &res, &det);
             }
+            self.control.audit_records = a.record_count();
+        } else {
+            self.pending_events = pending;
         }
         Ok(())
     }
 
     /// Atomic manifest commit: seal gen+1, write manifest file, then CURRENT,
-    /// then update the rollback witness.
+    /// then update the rollback witness. A write failure rolls the in-memory
+    /// generation back so the session never claims a commit that disk does not
+    /// have.
     fn commit(&mut self, detail: &str) -> Result<(), CoreError> {
-        let s = self.session()?;
-        let vault_id = s.vault_id;
-        let meta_key = s.domains.meta.clone();
+        let (vault_id, meta_key) = {
+            let s = self.session()?;
+            (s.vault_id, s.domains.meta.clone())
+        };
         let manifest = self.manifest.as_mut().ok_or(CoreError::Locked)?;
+        let witness = (
+            manifest.generation,
+            manifest.prev_manifest_hash,
+            manifest.committed_at_ms,
+        );
         manifest.generation += 1;
         manifest.committed_at_ms = now_ms();
         let gen = manifest.generation;
@@ -626,14 +826,36 @@ impl VaultEngine {
 
         let sealed = manifest.seal(&meta_key, &vault_id)?;
         let hash = manifest_hash(&sealed);
-        atomic_write(&self.layout.manifest_file(gen), &sealed)?;
-        fault_point("after_manifest_write");
-        atomic_write(&self.layout.current(), &encode_current(gen, &hash))?;
-        fault_point("after_current_write");
+
+        let disk = || -> Result<(), std::io::Error> {
+            atomic_write(&self.layout.manifest_file(gen), &sealed)?;
+            fault_point("after_manifest_write");
+            atomic_write(&self.layout.current(), &encode_current(gen, &hash))?;
+            fault_point("after_current_write");
+            Ok(())
+        };
+        if let Err(e) = disk() {
+            manifest.generation = witness.0;
+            manifest.prev_manifest_hash = witness.1;
+            manifest.committed_at_ms = witness.2;
+            return Err(e.into());
+        }
 
         self.control.max_seen_generation = gen;
         self.control.seen_manifest_hash = vault_crypto::to_hex(&hash);
-        let _ = self.control.save(&self.layout.control_file(), &vault_id);
+        if let Err(e) = self.control.save(&self.layout.control_file(), &vault_id) {
+            // The manifest is committed but the witness is not: without a
+            // loud failure this becomes a false rollback lockout at the next
+            // open. Surface it instead of swallowing (old `let _ =`).
+            self.pending_events.push((
+                now_ms(),
+                "control.unavailable".into(),
+                "control".into(),
+                "fail".into(),
+                format!("rollback witness save failed after commit: {e}"),
+            ));
+            return Err(e.into());
+        }
 
         self.audit_event("container.commit", "storage", "ok", detail)?;
         Ok(())
@@ -841,13 +1063,23 @@ impl VaultEngine {
         Ok((hdr.plaintext_len, hdr.chunk_count, hash))
     }
 
-    fn read_blob_into(&self, id: &Id, out: &mut Vec<u8>) -> Result<(), CoreError> {
+    fn read_blob_into(&self, id: &Id, expected_version: u32, out: &mut Vec<u8>) -> Result<(), CoreError> {
         let s = self.session()?;
         let path = self.object_path(id);
         let mut file = std::fs::File::open(&path)?;
         let mut header_bytes = [0u8; OBJECT_HEADER_SIZE];
         file.read_exact(&mut header_bytes)?;
         let header = ObjectHeader::parse(&header_bytes)?;
+        // Bind the blob to the manifest entry it claims to be. The chunk AAD
+        // derives from the *header's own* id/version, so a whole-file
+        // substitution (object A copied over object B's path) would decrypt
+        // cleanly without this check.
+        if header.object_id != *id {
+            return Err(CoreError::Integrity("object id mismatch"));
+        }
+        if header.version != expected_version {
+            return Err(CoreError::Integrity("object version mismatch"));
+        }
         if header.plaintext_len > MAX_INLINE_READ {
             return Err(CoreError::Invalid("object too large for inline read"));
         }
@@ -894,15 +1126,22 @@ impl VaultEngine {
         Ok(id)
     }
 
-    pub fn get_note(&self, id: &Id) -> Result<Note, CoreError> {
-        let _s = self.session()?;
-        let m = self.manifest()?;
-        let e = m.find_object(id).ok_or(CoreError::NotFound)?;
-        if e.object_type != ObjectType::Note {
-            return Err(CoreError::Invalid("not a note"));
-        }
+    pub fn get_note(&mut self, id: &Id) -> Result<Note, CoreError> {
+        self.session()?;
+        let (version, content_hash) = {
+            let m = self.manifest()?;
+            let e = m.find_object(id).ok_or(CoreError::NotFound)?;
+            if e.object_type != ObjectType::Note {
+                return Err(CoreError::Invalid("not a note"));
+            }
+            (e.version, e.content_hash)
+        };
         let mut buf = Vec::new();
-        self.read_blob_into(id, &mut buf)?;
+        self.read_blob_into(id, version, &mut buf)?;
+        if vault_crypto::sha256(&buf) != content_hash {
+            self.note_inline_integrity("note content hash mismatch");
+            return Err(CoreError::Integrity("content hash mismatch"));
+        }
         let json: serde_json::Value =
             serde_json::from_slice(&buf).map_err(|_| CoreError::Integrity("note payload malformed"))?;
         let content = json["content"].as_str().unwrap_or("").to_string();
@@ -999,14 +1238,22 @@ impl VaultEngine {
         Ok(id)
     }
 
-    pub fn get_password(&self, id: &Id) -> Result<PasswordRecord, CoreError> {
+    pub fn get_password(&mut self, id: &Id) -> Result<PasswordRecord, CoreError> {
         self.session()?;
-        let e = self.manifest()?.find_object(id).ok_or(CoreError::NotFound)?;
-        if e.object_type != ObjectType::Password {
-            return Err(CoreError::Invalid("not a password entry"));
-        }
+        let (version, content_hash) = {
+            let m = self.manifest()?;
+            let e = m.find_object(id).ok_or(CoreError::NotFound)?;
+            if e.object_type != ObjectType::Password {
+                return Err(CoreError::Invalid("not a password entry"));
+            }
+            (e.version, e.content_hash)
+        };
         let mut buf = Vec::new();
-        self.read_blob_into(id, &mut buf)?;
+        self.read_blob_into(id, version, &mut buf)?;
+        if vault_crypto::sha256(&buf) != content_hash {
+            self.note_inline_integrity("password content hash mismatch");
+            return Err(CoreError::Integrity("content hash mismatch"));
+        }
         let json: serde_json::Value =
             serde_json::from_slice(&buf).map_err(|_| CoreError::Integrity("password payload malformed"))?;
         let e = self.manifest()?.find_object(id).ok_or(CoreError::NotFound)?;
@@ -1065,7 +1312,10 @@ impl VaultEngine {
             e.meta.username = Some(username.to_string());
             e.meta.url = Some(url.to_string());
             e.meta.category = Some(category.to_string());
-            e.flags = if favorite { vault_container::manifest::object_flags::FAVORITE } else { 0 };
+            // Only touch the FAVORITE bit — the old whole-word assignment
+            // clobbered any other flag bits this entry might carry.
+            let fav = vault_container::manifest::object_flags::FAVORITE;
+            e.flags = if favorite { e.flags | fav } else { e.flags & !fav };
         }
         self.commit("password.update")?;
         self.set_pending_commit(false)?;
@@ -1135,71 +1385,145 @@ impl VaultEngine {
         Ok(id)
     }
 
-    /// Decrypt an object to `dst` (user-chosen path, staged in its own
-    /// directory and atomically renamed). Verifies the content hash.
+    /// Decrypt an object to `dst` (staged in the destination directory and
+    /// atomically renamed). Verifies the content hash **before** the rename,
+    /// so an existing `dst` is never replaced by unverified data and a
+    /// mismatch never deletes the user's previous file.
     pub fn export_file(&mut self, id: &Id, dst: &Path) -> Result<(), CoreError> {
-        let s = self.session()?;
-        let m = self.manifest()?;
-        let e = m.find_object(id).ok_or(CoreError::NotFound)?;
-        if e.object_type != ObjectType::File {
+        let (object_type, expected_hash, expected_size, version) = {
+            let m = self.manifest()?;
+            let e = m.find_object(id).ok_or(CoreError::NotFound)?;
+            (e.object_type, e.content_hash, e.size, e.version)
+        };
+        if object_type != ObjectType::File {
             return Err(CoreError::Invalid("not a file"));
         }
-        let expected_hash = e.content_hash;
-        let expected_size = e.size;
-        let path = self.object_path(id);
-        let data_key = s.domains.data.clone();
-        let vault_id = s.vault_id;
+        if self.path_inside_vault(dst) {
+            return Err(CoreError::Refused(
+                "refusing to export into the vault directory (the container is not a safe export target)",
+            ));
+        }
+        let (path, data_key, vault_id) = {
+            let s = self.session()?;
+            (self.object_path(id), s.domains.data.clone(), s.vault_id)
+        };
 
-        atomic_write_from(dst, |f| {
+        // Stage next to `dst` under our own temp naming, then verify, then
+        // rename. `atomic_write_from(dst)` directly would rename first and
+        // verify afterwards — a mismatch then deleted the *user's* old dst.
+        let staged = match dst.file_name() {
+            Some(name) => {
+                let rnd: [u8; 16] = vault_crypto::random_bytes();
+                let suffix: String = rnd.iter().map(|b| format!("{:02x}", b)).collect();
+                dst.with_file_name(format!("{}.{}.tmp", name.to_string_lossy(), suffix))
+            }
+            None => return Err(CoreError::Invalid("export target has no file name")),
+        };
+
+        let write_result = atomic_write_from(&staged, |f| {
             let mut file = std::fs::File::open(&path)?;
             let mut header_bytes = [0u8; OBJECT_HEADER_SIZE];
             file.read_exact(&mut header_bytes)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             let header = ObjectHeader::parse(&header_bytes)
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
+            if header.object_id != *id || header.version != version {
+                return Err(std::io::Error::other("object id/version mismatch"));
+            }
             vault_container::open_object(&mut file, &header, &data_key, &vault_id, f)
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
             Ok(())
-        })?;
+        });
+        if let Err(e) = write_result {
+            let _ = std::fs::remove_file(&staged);
+            return Err(e.into());
+        }
 
-        // Verify against the manifest's authenticated expectations.
-        let mut hasher = Sha256Writer::new();
-        let mut file = std::fs::File::open(dst)?;
-        let mut buf = vec![0u8; 1024 * 1024];
-        let mut total = 0u64;
-        loop {
-            let n = file.read(&mut buf)?;
-            if n == 0 {
-                break;
+        // Verify the staged plaintext against the manifest's expectations.
+        let verify = (|| -> std::io::Result<bool> {
+            let mut file = std::fs::File::open(&staged)?;
+            let mut hasher = Sha256Writer::new();
+            let mut buf = vec![0u8; 1024 * 1024];
+            let mut total = 0u64;
+            loop {
+                let n = file.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                total += n as u64;
             }
-            hasher.update(&buf[..n]);
-            total += n as u64;
+            Ok(hasher.finalize() == expected_hash && total == expected_size)
+        })();
+        match verify {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = std::fs::remove_file(&staged);
+                self.note_inline_integrity("exported content hash/size mismatch");
+                return Err(CoreError::Integrity("exported content hash mismatch"));
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&staged);
+                return Err(e.into());
+            }
         }
-        if hasher.finalize() != expected_hash {
-            let _ = std::fs::remove_file(dst);
-            self.note_inline_integrity("exported content hash mismatch");
-            return Err(CoreError::Integrity("exported content hash mismatch"));
-        }
-        if total != expected_size {
-            let _ = std::fs::remove_file(dst);
-            return Err(CoreError::Integrity("exported size mismatch"));
+
+        // Verified: atomically put it in place (same directory → same volume).
+        if let Err(e) = std::fs::rename(&staged, dst) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(e.into());
         }
         Ok(())
+    }
+
+    /// True when `dst` resolves inside the vault directory (including via a
+    /// symlinked parent): exporting ciphertext-derived plaintext back into
+    /// the container could overwrite container files with decrypted data.
+    fn path_inside_vault(&self, dst: &Path) -> bool {
+        fn normalize(p: &Path) -> PathBuf {
+            let mut out = PathBuf::new();
+            for c in p.components() {
+                match c {
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => {
+                        out.pop();
+                    }
+                    other => out.push(other.as_os_str()),
+                }
+            }
+            out
+        }
+        // Lexical pass (handles `..` and missing parents).
+        if let (Ok(d), Ok(r)) = (std::path::absolute(dst), std::path::absolute(self.layout.root())) {
+            if normalize(&d).starts_with(normalize(&r)) {
+                return true;
+            }
+        }
+        // Canonical pass (handles symlinked parents).
+        if let (Ok(p), Ok(r)) = (
+            dst.parent().map(std::fs::canonicalize).unwrap_or(Ok(PathBuf::new())),
+            std::fs::canonicalize(self.layout.root()),
+        ) {
+            if !p.as_os_str().is_empty() && p.starts_with(&r) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Read a small text-like payload into memory (notes, text files).
     pub fn read_text(&mut self, id: &Id) -> Result<String, CoreError> {
         self.session()?;
-        let (mime, is_note) = {
+        let (mime, is_note, version) = {
             let m = self.manifest()?;
             let e = m.find_object(id).ok_or(CoreError::NotFound)?;
-            (e.meta.mime.clone(), e.object_type == ObjectType::Note)
+            (e.meta.mime.clone(), e.object_type == ObjectType::Note, e.version)
         };
         if !is_note && !mime.as_deref().map(is_text_mime).unwrap_or(false) {
             return Err(CoreError::Invalid("not a text object"));
         }
         let mut buf = Vec::new();
-        self.read_blob_into(id, &mut buf)?;
+        self.read_blob_into(id, version, &mut buf)?;
         let expected = self.manifest()?.find_object(id).map(|e| e.content_hash);
         if let Some(expected) = expected {
             let hash = vault_crypto::sha256(&buf);
@@ -1245,7 +1569,7 @@ impl VaultEngine {
 
     fn note_inline_integrity(&mut self, detail: &str) {
         let now = now_ms();
-        self.lockdown.evaluate(
+        self.eval_trigger(
             Trigger::new(
                 "object.auth_failed",
                 80,
@@ -1271,6 +1595,9 @@ impl VaultEngine {
     /// Heal interrupted updates: a blob whose version is newer than the
     /// manifest entry means the crash happened between blob write and
     /// manifest commit. Re-derive size/hash from the blob and commit.
+    /// Blobs that cannot be decrypted are skipped (deep integrity
+    /// verification reports them); they must not abort the heal of the
+    /// remaining objects or strand `pending_commit` forever.
     fn heal_pending_updates(&mut self) -> Result<(), CoreError> {
         let session_vault_id = self.session()?.vault_id;
         let data_key = self.session()?.domains.data.clone();
@@ -1299,16 +1626,28 @@ impl VaultEngine {
             if header.version <= entry_version {
                 continue;
             }
-            // Newer blob: decrypt fully to recover the authenticated size+hash.
-            let mut out = Vec::new();
-            vault_container::open_object(&mut file, &header, &data_key, &session_vault_id, &mut out)?;
-            let hash = vault_crypto::sha256(&out);
-            drop(out);
+            // Newer blob: stream it into a hash sink to recover the
+            // authenticated size+hash without buffering the payload.
+            let mut sink = HashingSink::new();
+            if let Err(e) =
+                vault_container::open_object(&mut file, &header, &data_key, &session_vault_id, &mut sink)
+            {
+                self.pending_events.push((
+                    now_ms(),
+                    "container.heal".into(),
+                    "storage".into(),
+                    "fail".into(),
+                    format!("{}: unreadable newer blob ({e})", vault_crypto::to_hex16(&id)),
+                ));
+                continue;
+            }
+            let total = sink.len;
+            let hash = sink.hasher.finalize();
             {
                 let m = self.manifest.as_mut().ok_or(CoreError::Locked)?;
                 if let Some(e) = m.objects.iter_mut().find(|o| o.id == id) {
                     e.version = header.version;
-                    e.size = header.plaintext_len;
+                    e.size = total;
                     e.chunk_count = header.chunk_count;
                     e.content_hash = hash;
                     e.updated_ms = now_ms();
@@ -1339,7 +1678,11 @@ impl VaultEngine {
                 if let Some(num) = name
                     .strip_prefix("manifest-")
                     .and_then(|s| s.strip_suffix(".bin"))
-                    .and_then(|s| u64::from_str_radix(s, 16).ok())
+                    // Generation numbers are DECIMAL (`manifest-{:016}.bin`);
+                    // the old hex parse made `…000000000000000a` style names
+                    // parse as generation 10 — deleting the *current* manifest
+                    // at generation ≥ 10 and bricking the vault.
+                    .and_then(|s| s.parse::<u64>().ok())
                 {
                     if num > generation {
                         let _ = std::fs::remove_file(entry.path());
@@ -1389,7 +1732,12 @@ impl VaultEngine {
     }
 
     /// Deep integrity verification: decrypt every object, verify content
-    /// hashes, manifest chain, header structure.
+    /// hashes and header/manifest consistency.
+    ///
+    /// Note: the manifest hash *chain* and the rollback witness are enforced
+    /// on every state load via `read_verified_manifest_bytes` (unlock, rekey,
+    /// recovery); this function walks the object layer and folds the current
+    /// lockdown state into the report rather than re-walking the chain.
     pub fn verify_integrity(&mut self, deep: bool) -> Result<IntegrityReport, CoreError> {
         let s = self.session()?;
         let mut report = IntegrityReport { ok: true, checked_objects: 0, failed: Vec::new(), warnings: Vec::new() };
@@ -1439,14 +1787,17 @@ impl VaultEngine {
             }
             report.checked_objects += 1;
             if deep {
-                let mut out = Vec::new();
-                match vault_container::open_object(&mut file, &header, &data_key, &vault_id, &mut out) {
+                // Stream into a hash sink — never buffer the payload.
+                let mut sink = HashingSink::new();
+                match vault_container::open_object(&mut file, &header, &data_key, &vault_id, &mut sink) {
                     Ok(_) => {
-                        if vault_crypto::sha256(&out) != content_hash {
+                        let total = sink.len;
+                        let hash = sink.hasher.finalize();
+                        if hash != content_hash {
                             report.ok = false;
                             report.failed.push(format!("{}: content hash mismatch", vault_crypto::to_hex16(&id)));
                         }
-                        if out.len() as u64 != size {
+                        if total != size {
                             report.ok = false;
                             report.failed.push(format!("{}: size mismatch", vault_crypto::to_hex16(&id)));
                         }
@@ -1459,9 +1810,17 @@ impl VaultEngine {
             }
         }
 
-        if !report.ok {
+        // A quarantined/restricted/locked vault is never "integrity ok",
+        // even when every object individually verifies.
+        let st = self.lockdown.state();
+        if !matches!(st, VaultState::Normal | VaultState::Suspicious) {
+            report.ok = false;
+            report.warnings.push(format!("lockdown state: {}", st.as_str()));
+        }
+
+        if !report.failed.is_empty() {
             let now = now_ms();
-            self.lockdown.evaluate(
+            self.eval_trigger(
                 Trigger::new(
                     "object.auth_failed",
                     85,
@@ -1483,7 +1842,9 @@ impl VaultEngine {
     /// Generate + attach a new recovery key. Returns the display form
     /// (shown exactly once; Vault does not persist it).
     pub fn enable_recovery(&mut self) -> Result<String, CoreError> {
-        let s = self.session()?;
+        // Rotating key material is a write like any other: LOCKED/RESTRICTED
+        // must not be able to swap the recovery envelope.
+        let s = self.require_writable()?;
         let root = s.root.clone();
         let rk = RecoveryKey::generate();
         let display = rk.to_display();
@@ -1527,17 +1888,18 @@ impl VaultEngine {
         new_kdf.salt = vault_crypto::random_bytes();
         new_header.rewrap_root(new_kdf, new_password, &root)?;
 
-        // Commit the new header only after full state load succeeds.
+        // Commit the new header only after full state load succeeds — routed
+        // through the verified read so hash/chain/vault-id/rollback witnesses
+        // and lockdown evaluation cannot be skipped on this path (the old
+        // inline read verified only the CURRENT hash and then trusted the
+        // result for `max_seen_generation`).
         let vault_id = self.header.vault_id;
         let domains = DomainKeys::derive(&root, &vault_id);
-        let cur_bytes = vault_storage::read_file_capped(&self.layout.current(), 4096)?;
-        let (generation, cur_hash) = decode_current(&cur_bytes)?;
-        let manifest_bytes =
-            vault_storage::read_file_capped(&self.layout.manifest_file(generation), 512 * 1024 * 1024)?;
-        if manifest_hash(&manifest_bytes) != cur_hash {
-            return Err(CoreError::Integrity("manifest hash mismatch"));
-        }
+        let (generation, cur_hash, manifest_bytes) = self.read_verified_manifest_bytes()?;
         let manifest = Manifest::open(&domains.meta, &manifest_bytes)?;
+        if manifest.generation != generation {
+            return Err(CoreError::Integrity("manifest generation mismatch"));
+        }
 
         atomic_write(&self.layout.header(), &new_header.to_bytes())?;
         self.header = new_header;
@@ -1547,7 +1909,7 @@ impl VaultEngine {
         self.control.lockout_until_ms = 0;
         self.control.max_seen_generation = generation;
         self.control.seen_manifest_hash = vault_crypto::to_hex(&cur_hash);
-        let _ = self.control.save(&self.layout.control_file(), &vault_id);
+        self.control.save(&self.layout.control_file(), &vault_id)?;
         let _ = self.open_audit();
         let _ = self.flush_pending_events();
         self.audit_event("recovery.unlock", "recovery", "ok", "recovered; password re-wrapped")?;
@@ -1593,7 +1955,7 @@ impl VaultEngine {
         let root_new = match self.header.unwrap_next(password) {
             Ok(r) => r,
             Err(_) => {
-                self.lockdown.evaluate(
+                self.eval_trigger(
                     Trigger::new(
                         "rekey.next_auth_failed",
                         100,
@@ -1623,7 +1985,7 @@ impl VaultEngine {
             Err(_) => match Manifest::open(&d_new.meta, &manifest_bytes) {
                 Ok(m) => (m, false),
                 Err(_) => {
-                    self.lockdown.evaluate(
+                    self.eval_trigger(
                         Trigger::new(
                             "rekey.manifest_undecryptable",
                             100,
@@ -1678,7 +2040,16 @@ impl VaultEngine {
             fault_point("after_rekey_manifest");
             self.control.max_seen_generation = manifest.generation;
             self.control.seen_manifest_hash = vault_crypto::to_hex(&hash);
-            let _ = self.control.save(&self.layout.control_file(), &vault_id);
+            if let Err(e) = self.control.save(&self.layout.control_file(), &vault_id) {
+                self.pending_events.push((
+                    now_ms(),
+                    "control.unavailable".into(),
+                    "control".into(),
+                    "fail".into(),
+                    format!("rollback witness save failed after rekey commit: {e}"),
+                ));
+                return Err(e.into());
+            }
         }
 
         // Phase D: promote the next envelope to current. The recovery
@@ -1698,9 +2069,10 @@ impl VaultEngine {
     /// The rewrite is a streaming copy into a temp file + atomic rename, so
     /// a crash leaves either the complete old or the complete new header —
     /// never a torn one. Blobs whose DEK already opens under `new_data` are
-    /// left untouched (idempotency); blobs missing on disk are skipped, not
-    /// fatal — their absence predates the rekey and is reported by deep
-    /// integrity verification instead.
+    /// left untouched (idempotency); blobs missing on disk **or with a
+    /// truncated/corrupt header** are skipped, not fatal — same rationale as
+    /// missing blobs: their condition predates the rekey and is reported by
+    /// deep integrity verification instead of bricking the migration.
     fn rewrap_blob_dek(
         &self,
         id: &Id,
@@ -1714,10 +2086,21 @@ impl VaultEngine {
             Err(_) => return Ok(()),
         };
         let mut header_bytes = [0u8; OBJECT_HEADER_SIZE];
-        file.read_exact(&mut header_bytes)
-            .map_err(|_| CoreError::Integrity("blob header truncated"))?;
-        let mut header = ObjectHeader::parse(&header_bytes)?;
-        if !header.rewrap_dek(old_data, new_data, vault_id)? {
+        if file.read_exact(&mut header_bytes).is_err() {
+            return Ok(()); // truncated header: skipped like a missing blob
+        }
+        let mut header = match ObjectHeader::parse(&header_bytes) {
+            Ok(h) => h,
+            Err(_) => return Ok(()), // corrupt header: skipped, not fatal
+        };
+        let migrated = match header.rewrap_dek(old_data, new_data, vault_id) {
+            Ok(v) => v,
+            // DEK opens under neither key: corrupt/unreadable. Skip — after
+            // finalize the old key is gone anyway (crypto-erasure of an
+            // already-broken blob); deep verification reports it.
+            Err(_) => return Ok(()),
+        };
+        if !migrated {
             return Ok(()); // already migrated
         }
         let new_header = header.to_bytes();
@@ -1726,6 +2109,37 @@ impl VaultEngine {
             std::io::copy(&mut file, out)?;
             Ok(())
         })?;
+        Ok(())
+    }
+
+    /// Drive the armed domain rekey to completion and install the new
+    /// session. Any error here means the container may be half-migrated —
+    /// the caller must drop the session (see `crypto_erase(Domain)`).
+    fn finish_domain_rekey(
+        &mut self,
+        pw: &SecretBytes,
+        root_old: Key32,
+        root_new: Key32,
+        vault_id: [u8; 16],
+    ) -> Result<(), CoreError> {
+        let confirmed = self.drive_rekey(pw, root_old)?;
+        if confirmed.as_bytes() != root_new.as_bytes() {
+            return Err(CoreError::Integrity("domain rekey key mismatch"));
+        }
+        // Install the session under the new root and reload state
+        // (the migration committed generation+1 to disk).
+        let domains = DomainKeys::derive(&root_new, &vault_id);
+        self.session = Some(Session {
+            root: root_new,
+            domains,
+            vault_id,
+        });
+        let (_gen, _hash, bytes) = self.read_verified_manifest_bytes()?;
+        let meta_key = self.session.as_ref().unwrap().domains.meta.clone();
+        self.manifest = Some(Manifest::open(&meta_key, &bytes)?);
+        self.audit = None;
+        let _ = self.open_audit();
+        let _ = self.flush_pending_events();
         Ok(())
     }
 
@@ -1764,33 +2178,26 @@ impl VaultEngine {
                 let root_new = Key32::random();
                 let mut next_kdf = self.header.kdf.clone();
                 next_kdf.salt = vault_crypto::random_bytes();
+                let header_before_arm = self.header.clone();
                 self.header.arm_rekey(pw, next_kdf, &root_new)?;
-                atomic_write(&self.layout.header(), &self.header.to_bytes())?;
+                if let Err(e) = atomic_write(&self.layout.header(), &self.header.to_bytes()) {
+                    // Disk never saw the arm — keep memory consistent with it
+                    // instead of leaving a phantom pending transition.
+                    self.header = header_before_arm;
+                    return Err(e.into());
+                }
                 fault_point("after_rekey_arm");
 
                 // Phase 2+3: migrate blobs/audit/manifest, then finalize.
                 // Probing finds everything on the old key (nothing migrated
                 // yet), so this runs the full migration; on crash the next
-                // unlock resumes it idempotently.
-                let confirmed = self.drive_rekey(pw, root_old)?;
-                if confirmed.as_bytes() != root_new.as_bytes() {
-                    return Err(CoreError::Integrity("domain rekey key mismatch"));
+                // unlock resumes it idempotently. Any failure drops the
+                // session — never keep a session on keys that may no longer
+                // match the container (the migration may be half-applied).
+                if let Err(e) = self.finish_domain_rekey(pw, root_old, root_new, vault_id) {
+                    self.lock(LockReason::Tamper);
+                    return Err(e);
                 }
-
-                // Install the session under the new root and reload state
-                // (the migration committed generation+1 to disk).
-                let domains = DomainKeys::derive(&root_new, &vault_id);
-                self.session = Some(Session {
-                    root: root_new,
-                    domains,
-                    vault_id,
-                });
-                let (_gen, _hash, bytes) = self.read_verified_manifest_bytes()?;
-                let meta_key = self.session.as_ref().unwrap().domains.meta.clone();
-                self.manifest = Some(Manifest::open(&meta_key, &bytes)?);
-                self.audit = None;
-                let _ = self.open_audit();
-                let _ = self.flush_pending_events();
                 let recovery_dropped = had_recovery && !self.header.has_recovery();
                 let detail = if recovery_dropped {
                     "root key rotated; recovery envelope destroyed"
@@ -1814,7 +2221,11 @@ impl VaultEngine {
                 // 2. Remove container files (they are ciphertext without keys).
                 let _ = std::fs::remove_dir_all(self.layout.root());
                 self.session = None;
-                self.manifest = None;
+                // Wipe plaintext metadata (names, tags, previews) — keys are
+                // gone but the manifest may still hold readable strings.
+                if let Some(mut m) = self.manifest.take() {
+                    m.wipe();
+                }
                 self.audit = None;
                 Ok(())
             }
@@ -1857,11 +2268,25 @@ impl VaultEngine {
     }
 
     pub fn acknowledge_findings(&mut self) -> Result<(), CoreError> {
+        // Acknowledging requires a proven session: a locked engine cannot
+        // clear findings without re-authenticating first.
+        self.session()?;
         let now = now_ms();
+        let before = self.lockdown.events().len();
         self.lockdown.acknowledge(now);
-        let ev = self.lockdown.events().last().cloned();
-        if let Some(e) = ev {
-            let _ = self.audit_event("operator.acknowledge", "lockdown", "ok", &e.detail);
+        self.save_lockdown();
+        // `acknowledge` is a no-op unless the state was SUSPICIOUS — only
+        // log when it actually recorded the acknowledgment.
+        let ack_detail = {
+            let evs = self.lockdown.events();
+            if evs.len() > before {
+                Some(evs.last().unwrap().detail.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(detail) = ack_detail {
+            let _ = self.audit_event("operator.acknowledge", "lockdown", "ok", &detail);
         }
         Ok(())
     }
@@ -1880,5 +2305,42 @@ impl VaultEngine {
 
     pub fn probe_platform() -> PlatformCapability {
         probe_capabilities()
+    }
+}
+
+impl Drop for VaultEngine {
+    fn drop(&mut self) {
+        // Plaintext metadata (names, tags, previews) must not outlive the
+        // engine even when the caller forgets to lock.
+        if let Some(mut m) = self.manifest.take() {
+            m.wipe();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_below_threshold_has_no_lockout() {
+        assert_eq!(lockout_delay_ms(0), None);
+        assert_eq!(lockout_delay_ms(4), None);
+    }
+
+    #[test]
+    fn backoff_doubles_per_failure() {
+        assert_eq!(lockout_delay_ms(5), Some(300_000)); // 5 min
+        assert_eq!(lockout_delay_ms(6), Some(600_000)); // 10 min
+        assert_eq!(lockout_delay_ms(7), Some(1_200_000)); // 20 min
+        assert_eq!(lockout_delay_ms(8), Some(2_400_000)); // 40 min
+    }
+
+    #[test]
+    fn backoff_caps_at_one_hour() {
+        assert_eq!(lockout_delay_ms(9), Some(MAX_LOCKOUT_MS)); // would be 80 min
+        assert_eq!(lockout_delay_ms(10), Some(MAX_LOCKOUT_MS));
+        assert_eq!(lockout_delay_ms(100), Some(MAX_LOCKOUT_MS));
+        assert_eq!(lockout_delay_ms(u32::MAX), Some(MAX_LOCKOUT_MS));
     }
 }

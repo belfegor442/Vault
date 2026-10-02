@@ -225,9 +225,20 @@ fn file_import_export_multi_chunk_roundtrip() {
     assert_eq!(listed[0].kind, ItemKind::File);
     assert_eq!(listed[0].size, payload.len() as u64);
 
-    let dst = dir.path().join("out.bin");
+    // Export targets live OUTSIDE the vault directory (self-export into the
+    // container is refused by the engine).
+    let out_dir = TempDir::new().unwrap();
+    let dst = out_dir.path().join("out.bin");
     engine.export_file(&id, &dst).unwrap();
     assert_eq!(std::fs::read(&dst).unwrap(), payload);
+
+    // Exporting back into the vault directory must be refused.
+    let inside = dir.path().join("inside.bin");
+    assert!(matches!(
+        engine.export_file(&id, &inside),
+        Err(CoreError::Refused(_))
+    ));
+    assert!(!inside.exists());
 
     // Binary payloads are not readable as text.
     assert!(matches!(engine.read_text(&id), Err(CoreError::Invalid(_))));
@@ -278,7 +289,8 @@ fn integrity_detects_corrupted_blob_and_manifest() {
 #[test]
 fn rollback_of_container_is_detected() {
     let dir = TempDir::new().unwrap();
-    let (mut engine, _) = create_vault(&dir, false);
+    let (mut engine, recovery) = create_vault(&dir, true);
+    let display = recovery.expect("recovery key issued at create");
 
     // Snapshot the generation-1 commit.
     let saved_current = std::fs::read(dir.path().join("CURRENT")).unwrap();
@@ -294,8 +306,17 @@ fn rollback_of_container_is_detected() {
         engine.unlock(&pw("test-master-password")),
         Err(CoreError::RollbackDetected)
     ));
-    // Lockdown recorded the attempt.
+    // Lockdown recorded the attempt and mapped it to LOCKED (session gone).
     assert!(!engine.lockdown_events().is_empty());
+    assert_eq!(engine.security_report().lockdown_state, "LOCKED");
+
+    // The recovery path must not bypass the witness either.
+    let mut engine = VaultEngine::open(dir.path()).unwrap();
+    assert!(matches!(
+        engine.unlock_with_recovery(&display, &pw("brand-new-password")),
+        Err(CoreError::RollbackDetected)
+    ));
+    assert_eq!(engine.security_report().lockdown_state, "LOCKED");
 }
 
 #[test]
@@ -528,4 +549,68 @@ fn status_reports_platform_capability_and_versions() {
     assert!(st.binary_verified, "hash of running test binary must match");
     assert!(st.platform_capability.to_lowercase().contains("dpapi"));
     assert_eq!(st.lockdown_state, "NORMAL");
+}
+
+#[test]
+fn gc_keeps_current_manifest_at_generation_10_and_beyond() {
+    let dir = TempDir::new().unwrap();
+    let (mut engine, _) = create_vault(&dir, false);
+    for i in 0..12 {
+        engine.add_note(&format!("note-{i}"), "body", None).unwrap();
+    }
+    assert!(engine.status().generation > 10, "need generation >= 10");
+    drop(engine);
+
+    // Reopening runs collect_garbage over the manifest directory; a
+    // decimal/hex parse slip here would delete the *current* manifest
+    // at generation >= 10 and brick the vault.
+    let mut engine = VaultEngine::open(dir.path()).unwrap();
+    engine.unlock(&pw("test-master-password")).unwrap();
+    assert_eq!(engine.list(None).unwrap().len(), 12);
+    let report = engine.verify_integrity(true).unwrap();
+    assert!(report.ok, "{:?}", report.failed);
+}
+
+#[test]
+fn swapped_object_blobs_are_refused() {
+    let dir = TempDir::new().unwrap();
+    let (mut engine, _) = create_vault(&dir, false);
+    let a = engine.add_note("Alpha", "alpha-secret", None).unwrap();
+    let b = engine.add_note("Beta", "beta-secret", None).unwrap();
+
+    let blob_path = |id: &[u8; 16]| {
+        let hex: String = id.iter().map(|byte| format!("{byte:02x}")).collect();
+        dir.path().join("objects").join(&hex[..2]).join(&hex)
+    };
+    let (pa, pb) = (blob_path(&a), blob_path(&b));
+    let (ba, bb) = (std::fs::read(&pa).unwrap(), std::fs::read(&pb).unwrap());
+    std::fs::write(&pa, &bb).unwrap();
+    std::fs::write(&pb, &ba).unwrap();
+
+    // Blob AAD binds the object id: neither slot accepts the other's blob.
+    assert!(engine.get_note(&a).is_err());
+    assert!(engine.get_note(&b).is_err());
+    let report = engine.verify_integrity(true).unwrap();
+    assert!(!report.ok);
+    assert!(report.failed.len() >= 2, "{:?}", report.failed);
+}
+
+#[test]
+fn deleted_control_state_raises_control_unavailable() {
+    let dir = TempDir::new().unwrap();
+    let (engine, _) = create_vault(&dir, false);
+    drop(engine);
+    std::fs::remove_file(dir.path().join("state").join("ctl.bin")).unwrap();
+
+    let mut engine = VaultEngine::open(dir.path()).unwrap();
+    let events = engine.lockdown_events();
+    assert!(
+        events.iter().any(|e| e.rule == "control.unavailable"),
+        "missing control.unavailable event: {events:?}"
+    );
+    assert_eq!(engine.security_report().lockdown_state, "SUSPICIOUS");
+
+    // The vault still unlocks, and the witness is rebuilt on the next save.
+    engine.unlock(&pw("test-master-password")).unwrap();
+    assert!(dir.path().join("state").join("ctl.bin").exists());
 }

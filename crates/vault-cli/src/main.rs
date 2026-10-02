@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use vault_container::parse_id_hex;
 use vault_core::{CreateOptions, EraseScope, ItemKind, ItemSummary, VaultEngine};
 use vault_crypto::SecretBytes;
+use zeroize::Zeroizing;
 
 const USAGE: &str = r#"vault-cli — native Vault command line interface
 
@@ -109,48 +110,69 @@ fn take_flag(args: &mut Vec<String>, name: &str) -> bool {
     false
 }
 
+/// Pop the next positional argument (must be first and not a flag).
+fn take_pos(args: &mut Vec<String>) -> Option<String> {
+    if args.is_empty() {
+        return None;
+    }
+    Some(args.remove(0))
+}
+
 // ------------------------------------------------------------- passwords
 
 fn master_password() -> Res<SecretBytes> {
     if let Ok(p) = std::env::var("VAULT_PASSWORD") {
-        eprintln!("warning: master password read from VAULT_PASSWORD (test/automation only)");
-        return Ok(SecretBytes::from_str(&p));
+        if !p.is_empty() {
+            eprintln!("warning: master password read from VAULT_PASSWORD (test/automation only)");
+            return Ok(SecretBytes::from_str(&p));
+        }
+        // empty env value is not a usable password: fall through to the TTY
     }
-    let p = rpassword::prompt_password("Master password: ").map_err(err)?;
-    Ok(SecretBytes::from_str(&p))
+    let p = Zeroizing::new(rpassword::prompt_password("Master password: ").map_err(err)?);
+    Ok(SecretBytes::from_str(p.as_str()))
 }
 
 fn new_password_pair() -> Res<SecretBytes> {
     if let Ok(p) = std::env::var("VAULT_NEW_PASSWORD") {
-        eprintln!("warning: new password read from VAULT_NEW_PASSWORD (test/automation only)");
-        return Ok(SecretBytes::from_str(&p));
+        if !p.is_empty() {
+            eprintln!("warning: new password read from VAULT_NEW_PASSWORD (test/automation only)");
+            return Ok(SecretBytes::from_str(&p));
+        }
+        // empty env value: fall through to the TTY
     }
-    let a = rpassword::prompt_password("New master password: ").map_err(err)?;
-    let b = rpassword::prompt_password("Confirm new password: ").map_err(err)?;
-    if a != b {
+    let a = Zeroizing::new(rpassword::prompt_password("New master password: ").map_err(err)?);
+    let b = Zeroizing::new(rpassword::prompt_password("Confirm new password: ").map_err(err)?);
+    if a.as_str() != b.as_str() {
         return Err("passwords do not match".into());
     }
-    Ok(SecretBytes::from_str(&a))
+    Ok(SecretBytes::from_str(a.as_str()))
 }
 
 fn initial_password() -> Res<SecretBytes> {
     if let Ok(p) = std::env::var("VAULT_PASSWORD") {
-        eprintln!("warning: master password read from VAULT_PASSWORD (test/automation only)");
-        return Ok(SecretBytes::from_str(&p));
+        if !p.is_empty() {
+            eprintln!("warning: master password read from VAULT_PASSWORD (test/automation only)");
+            return Ok(SecretBytes::from_str(&p));
+        }
+        // empty env value: fall through to the TTY
     }
-    let a = rpassword::prompt_password("Choose a master password (min 8 chars): ").map_err(err)?;
-    let b = rpassword::prompt_password("Confirm master password: ").map_err(err)?;
-    if a != b {
+    let a = Zeroizing::new(rpassword::prompt_password("Choose a master password (min 8 chars): ").map_err(err)?);
+    let b = Zeroizing::new(rpassword::prompt_password("Confirm master password: ").map_err(err)?);
+    if a.as_str() != b.as_str() {
         return Err("passwords do not match".into());
     }
-    Ok(SecretBytes::from_str(&a))
+    Ok(SecretBytes::from_str(a.as_str()))
 }
 
 // --------------------------------------------------------------- helpers
 
 fn default_dir() -> PathBuf {
     if let Ok(d) = std::env::var("VAULT_DIR") {
-        return PathBuf::from(d);
+        if !d.trim().is_empty() {
+            return PathBuf::from(d);
+        }
+        // empty/whitespace VAULT_DIR would silently resolve to an empty
+        // path: fall through to the platform default
     }
     #[cfg(windows)]
     {
@@ -388,8 +410,9 @@ fn cmd_list(dir: &Path, args: &mut Vec<String>) -> Res<()> {
 }
 
 fn cmd_note(dir: &Path, args: &mut Vec<String>) -> Res<()> {
-    let id = parse_id(args.first().ok_or("usage: vault-cli note <id>")?)?;
-    let engine = unlock_engine(dir)?;
+    let raw = take_pos(args).ok_or("usage: vault-cli note <id>")?;
+    let id = parse_id(&raw)?;
+    let mut engine = unlock_engine(dir)?;
     let note = engine.get_note(&id).map_err(err)?;
     println!("title:   {}", note.title);
     println!("created: {}", fmt_ms(note.created_ms));
@@ -403,8 +426,9 @@ fn cmd_note(dir: &Path, args: &mut Vec<String>) -> Res<()> {
 }
 
 fn cmd_password(dir: &Path, args: &mut Vec<String>) -> Res<()> {
-    let id = parse_id(args.first().ok_or("usage: vault-cli password <id>")?)?;
-    let engine = unlock_engine(dir)?;
+    let raw = take_pos(args).ok_or("usage: vault-cli password <id>")?;
+    let id = parse_id(&raw)?;
+    let mut engine = unlock_engine(dir)?;
     let rec = engine.get_password(&id).map_err(err)?;
     println!("name:     {}", rec.name);
     println!("username: {}", rec.username);
@@ -420,8 +444,8 @@ fn cmd_password(dir: &Path, args: &mut Vec<String>) -> Res<()> {
 }
 
 fn cmd_export(dir: &Path, args: &mut Vec<String>) -> Res<()> {
-    let id = parse_id(args.first().ok_or("usage: vault-cli export <id> --out <path>")?)?;
-    args.remove(0);
+    let raw = take_pos(args).ok_or("usage: vault-cli export <id> --out <path>")?;
+    let id = parse_id(&raw)?;
     let out = take_opt(args, "--out").ok_or("export requires --out <path>")?;
     let mut engine = unlock_engine(dir)?;
     engine.export_file(&id, Path::new(&out)).map_err(err)?;
@@ -434,6 +458,7 @@ fn cmd_search(dir: &Path, args: &mut Vec<String>) -> Res<()> {
         return Err("usage: vault-cli search <query>".into());
     }
     let query = args.join(" ");
+    args.clear(); // the whole remainder is the query
     let engine = unlock_engine(dir)?;
     let items = engine.search(&query).map_err(err)?;
     print_items(&items);
@@ -441,7 +466,8 @@ fn cmd_search(dir: &Path, args: &mut Vec<String>) -> Res<()> {
 }
 
 fn cmd_delete(dir: &Path, args: &mut Vec<String>) -> Res<()> {
-    let id = parse_id(args.first().ok_or("usage: vault-cli delete <id>")?)?;
+    let raw = take_pos(args).ok_or("usage: vault-cli delete <id>")?;
+    let id = parse_id(&raw)?;
     let mut engine = unlock_engine(dir)?;
     engine.delete_object(&id).map_err(err)?;
     println!("deleted (object key destroyed)");
@@ -449,7 +475,8 @@ fn cmd_delete(dir: &Path, args: &mut Vec<String>) -> Res<()> {
 }
 
 fn cmd_favorite(dir: &Path, args: &mut Vec<String>) -> Res<()> {
-    let id = parse_id(args.first().ok_or("usage: vault-cli favorite <id>")?)?;
+    let raw = take_pos(args).ok_or("usage: vault-cli favorite <id>")?;
+    let id = parse_id(&raw)?;
     let mut engine = unlock_engine(dir)?;
     engine.toggle_favorite(&id).map_err(err)?;
     println!("favorite toggled");
@@ -463,11 +490,12 @@ fn cmd_folder(dir: &Path, args: &mut Vec<String>) -> Res<()> {
     }
     match sub.as_str() {
         "create" => {
-            let name = args.first().cloned().ok_or("usage: vault-cli folder create <name> [--parent id]")?;
             let parent = match take_opt(args, "--parent") {
                 Some(p) => Some(parse_id(&p)?),
                 None => None,
             };
+            let name = take_pos(args)
+                .ok_or("usage: vault-cli folder create <name> [--parent id]")?;
             let mut engine = unlock_engine(dir)?;
             let id = engine.create_folder(&name, parent).map_err(err)?;
             println!("folder: {}", vault_crypto::to_hex16(&id));
@@ -492,7 +520,8 @@ fn cmd_folder(dir: &Path, args: &mut Vec<String>) -> Res<()> {
             Ok(())
         }
         "delete" => {
-            let id = parse_id(args.first().ok_or("usage: vault-cli folder delete <id>")?)?;
+            let raw = take_pos(args).ok_or("usage: vault-cli folder delete <id>")?;
+            let id = parse_id(&raw)?;
             let mut engine = unlock_engine(dir)?;
             engine.delete_folder(&id).map_err(err)?;
             println!("folder deleted (children promoted to root)");
@@ -534,9 +563,18 @@ fn cmd_verify(dir: &Path, args: &mut Vec<String>) -> Res<()> {
 }
 
 fn cmd_audit(dir: &Path, args: &mut Vec<String>) -> Res<()> {
-    let limit: usize = take_opt(args, "--limit")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50);
+    let limit = match take_opt(args, "--limit") {
+        Some(v) => {
+            let n: usize = v
+                .parse()
+                .map_err(|_| format!("--limit requires a positive integer (got {v:?})"))?;
+            if n == 0 {
+                return Err("--limit must be greater than 0".into());
+            }
+            n
+        }
+        None => 50,
+    };
     let mut engine = unlock_engine(dir)?;
     let events = engine.audit_events(limit).map_err(err)?;
     if events.is_empty() {
@@ -622,11 +660,11 @@ fn cmd_recovery(dir: &Path, args: &mut Vec<String>) -> Res<()> {
 
 fn cmd_recover(dir: &Path) -> Res<()> {
     let display = match std::env::var("VAULT_RECOVERY_KEY") {
-        Ok(k) => {
+        Ok(k) if !k.trim().is_empty() => {
             eprintln!("warning: recovery key read from VAULT_RECOVERY_KEY (test/automation only)");
             k
         }
-        Err(_) => rpassword::prompt_password("Recovery key: ").map_err(err)?,
+        _ => rpassword::prompt_password("Recovery key: ").map_err(err)?,
     };
     let new = new_password_pair()?;
     let mut engine = open_engine(dir)?;
@@ -661,7 +699,8 @@ fn cmd_erase(dir: &Path, args: &mut Vec<String>) -> Res<()> {
 fn run() -> Res<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let dir = match take_opt(&mut args, "--dir") {
-        Some(d) => PathBuf::from(d),
+        Some(d) if !d.trim().is_empty() => PathBuf::from(d),
+        Some(_) => return Err("--dir requires a non-empty path".into()),
         None => default_dir(),
     };
     let help = take_flag(&mut args, "--help") || take_flag(&mut args, "-h");
@@ -675,7 +714,7 @@ fn run() -> Res<()> {
         return Ok(());
     }
 
-    match command.as_str() {
+    let result = match command.as_str() {
         "init" | "create" => cmd_init(&dir, &mut args),
         "status" => cmd_status(&dir),
         "add" => cmd_add(&dir, &mut args),
@@ -701,6 +740,15 @@ fn run() -> Res<()> {
             Ok(())
         }
         other => Err(format!("unknown command {other:?}\n\n{USAGE}")),
+    };
+    // Reject stray flags/positionals instead of silently ignoring them
+    // (e.g. `vault-cli list --knd password` or `stats extra`).
+    match result {
+        Ok(()) if !args.is_empty() => Err(format!(
+            "unexpected argument(s) for {command:?}: {}",
+            args.join(" ")
+        )),
+        other => other,
     }
 }
 

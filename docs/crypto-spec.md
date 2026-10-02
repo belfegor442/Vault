@@ -39,7 +39,7 @@ master password ──Argon2id(salt, m, t, p)──► KEK
      objects/<xx>/<id>   manifest-N.bin   audit.bin
 ```
 
-HKDF labels (salt/context = `vault_id`):
+HKDF labels (salt/context = `vault_id`, except the recovery KEK below):
 
 ```text
 vault:domain:data:v1        vault:domain:meta:v1
@@ -47,8 +47,10 @@ vault:domain:integrity:v1   vault:domain:control:v1
 vault:domain:recovery:v1    vault:domain:audit:v1
 ```
 
-Recovery KEK: `HKDF(recovery_key → "vault:recovery-kek:v1", ctx=vault_id)`
+Recovery KEK: `HKDF(recovery_key → "vault:recovery-kek:v1", ctx=vault_id||recovery_salt)`
 — no Argon2, because the recovery input is already 256 bits of CSPRNG output.
+The `recovery_salt` binds the envelope to the specific recovery material, so
+a stolen *old* recovery key cannot unwrap a re-issued envelope.
 
 ## Envelope (wrapped key)
 

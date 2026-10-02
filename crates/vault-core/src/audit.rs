@@ -13,8 +13,11 @@
 //! * Confidentiality: events are encrypted with the audit domain key.
 //! * Tamper evidence: removing, reordering or modifying any record breaks
 //!   the chain at verification time (AAD binds seq + previous hash).
-//! * Append-only by construction: the file is only ever extended; a
-//!   truncated log is detected (record count/hash mismatch).
+//! * Append-only by construction: the file is only ever extended. Removal of
+//!   a *suffix* of whole records is invisible to the chain itself and is
+//!   detected by the record-count anchor in control state
+//!   (`ControlState::audit_records`, checked at unlock); mid-record truncation
+//!   fails chain verification directly.
 //!
 //! Events must never contain secrets — callers are responsible for passing
 //! only event names, component names, results and non-sensitive details.
@@ -25,9 +28,12 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use vault_crypto::{open, seal, sha256, Key32};
-use vault_storage::atomic_write_from;
+use vault_storage::{atomic_write_from, read_file_capped};
 
 use crate::error::CoreError;
+
+/// Hard cap for the audit log (hostile input guard for the read-all paths).
+const MAX_AUDIT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
@@ -65,6 +71,12 @@ impl AuditLog {
         Ok(log)
     }
 
+    /// Number of records currently in the chain (the control-state anchor
+    /// value; see `ControlState::audit_records`).
+    pub fn record_count(&self) -> u64 {
+        self.next_seq
+    }
+
     pub fn append(&mut self, timestamp_ms: u64, event: &str, component: &str, result: &str, detail: &str) -> Result<u64, CoreError> {
         if event.len() > 128 || component.len() > 64 || result.len() > 32 || detail.len() > 512 {
             return Err(CoreError::Invalid("audit field too long"));
@@ -90,7 +102,7 @@ impl AuditLog {
 
         // Append is implemented as read-all + atomic replace: the log is
         // small (security events) and atomic replacement keeps crash safety.
-        let mut full = match std::fs::read(&self.path) {
+        let mut full = match read_file_capped(&self.path, MAX_AUDIT_BYTES) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e.into()),
@@ -157,7 +169,7 @@ impl AuditLog {
     /// Verify the whole chain. Returns the events plus the hash of the final
     /// record (the chain tip a subsequent append must chain from).
     fn read_and_verify(&self) -> Result<(Vec<AuditEvent>, [u8; 32]), CoreError> {
-        let bytes = match std::fs::read(&self.path) {
+        let bytes = match read_file_capped(&self.path, MAX_AUDIT_BYTES) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), [0u8; 32])),
             Err(e) => return Err(e.into()),

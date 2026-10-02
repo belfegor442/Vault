@@ -17,8 +17,14 @@ file is still individually valid.
 On unlock, after the manifest hash chain verifies:
 
 ```text
-if generation < control.max_seen_generation → RollbackDetected (CRITICAL)
+if generation < control.max_seen_generation → RollbackDetected (LOCKED, conf 95)
 ```
+
+A *same*-generation manifest whose hash differs from the witnessed hash also
+raises `rollback.detected`, but the read continues (the manifest is still
+verified against `CURRENT`, the chain, and the vault id) and the witness
+re-anchors to the observed pair — a second concurrent writer must not brick
+the vault, and forging a self-consistent manifest still requires the meta key.
 
 The witness is stored with DPAPI protection (entropy = `vault_id`); if DPAPI
 is unavailable it degrades to a plaintext record — the file still functions
@@ -41,11 +47,13 @@ mechanisms can never become a rollback bypass.
 
 ## Handling
 
-`RollbackDetected` is a CRITICAL lockdown trigger (confidence 95): writes
-stay blocked and the event is queued for the audit log. Restoration of a
-legitimate backup that is older than the witness therefore requires an
-explicit operator acknowledgement (`acknowledge_findings`) — Vault chooses
-to fail closed rather than silently accept rolled-back state.
+`RollbackDetected` maps to **LOCKED** with session destruction
+(confidence 95): the session is dropped, writes stay blocked, and the event
+is queued for the audit log. Restoration of a legitimate backup that is
+older than the witness therefore requires a fresh authentication — a
+successful unlock steps the state down to `SUSPICIOUS`, from where the
+operator can `acknowledge_findings` back to `NORMAL`. Vault chooses to fail
+closed rather than silently accept rolled-back state.
 
 ## What is *not* protected
 

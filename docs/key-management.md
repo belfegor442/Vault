@@ -15,7 +15,7 @@ master password (user, never persisted)
                      └─ recovery  ─ reserved
 
 recovery key (256-bit CSPRNG, shown once)
-   └─ HKDF("vault:recovery-kek:v1", ctx=vault_id) ─► same root envelope
+   └─ HKDF("vault:recovery-kek:v1", ctx=vault_id||recovery_salt) ─► same root envelope
 ```
 
 Per-object DEKs are fresh 256-bit values; the payload key of an object is

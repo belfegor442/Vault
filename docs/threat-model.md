@@ -24,7 +24,8 @@
    capped at 1 h), lockdown state machine records repeated failures.
 3. **Rollback attacker** — restores an older consistent container snapshot.
    Defenses: `max_seen_generation` + `seen_manifest_hash` witnessed in
-   control state; a lower generation is refused and escalates to CRITICAL.
+   control state; a lower generation is refused, escalates to LOCKED and
+   destroys the session (re-auth restores at most `SUSPICIOUS`).
 4. **Live tamperer (limited)** — modifies blobs, manifest, `CURRENT`,
    header fields. Defenses: AEAD + hash chain detect every stored structure;
    the header's root-envelope AAD covers identity and KDF parameters.
@@ -51,8 +52,10 @@
 | SUSPICIOUS | low-confidence findings acknowledged or pending | allowed |
 | RESTRICTED | sustained failures / integrity warnings | blocked by policy |
 | LOCKED | auth suspended until backoff expires | blocked |
-| CRITICAL | rollback or manifest tamper witnessed | blocked; requires operator acknowledgement |
+| CRITICAL | reserved for operator-declared compromise | blocked; requires `resolve_critical` |
 
-CRITICAL is only reachable through explicit high-severity triggers
-(rollback, manifest/vault-id mismatch, repeated auth failure bursts) and is
-never used as a generic error path.
+`CRITICAL` is reachable only through `Lockdown::escalate_critical`
+(an explicit operator declaration); no rule-table trigger maps to it —
+tamper-class findings (rollback, manifest/vault-id mismatch, rekey
+failures) land in `LOCKED` with session destruction instead, and are never
+used as a generic error path.

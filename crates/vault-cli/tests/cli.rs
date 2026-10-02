@@ -190,13 +190,25 @@ fn import_export_and_deep_verify() {
     assert!(out.ok, "{}", out.stderr);
     let id = extract_id(&out.stdout, "imported:");
 
-    let dst = dir.path().join("restored.bin");
+    // Export must target a path OUTSIDE the vault directory (self-export
+    // into the container is deliberately refused).
+    let out_dir = TempDir::new().unwrap();
+    let dst = out_dir.path().join("restored.bin");
     let out = run(
         dir.path(),
         &["export", &id, "--out", dst.to_str().unwrap()],
     );
     assert!(out.ok, "{}", out.stderr);
     assert_eq!(std::fs::read(&dst).unwrap(), payload);
+
+    // …and the container itself must refuse an in-vault destination.
+    let bad_dst = dir.path().join("inside.bin");
+    let out = run(
+        dir.path(),
+        &["export", &id, "--out", bad_dst.to_str().unwrap()],
+    );
+    assert!(!out.ok, "export into the vault dir must fail");
+    assert!(!bad_dst.exists());
 
     let out = run(dir.path(), &["verify", "--deep"]);
     assert!(out.ok, "{}", out.stderr);

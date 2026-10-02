@@ -24,7 +24,7 @@
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use vault_container::{VaultHeader, ContainerError};
 use vault_crypto::{random_bytes, CryptoError, Key32, SecretBytes};
@@ -98,9 +98,11 @@ impl RecoveryKey {
         {
             return Err(CryptoError::Malformed("recovery key contains invalid characters"));
         }
-        let raw = STANDARD
-            .decode(&cleaned)
-            .map_err(|_| CryptoError::Malformed("recovery key is not valid base64"))?;
+        let raw = Zeroizing::new(
+            STANDARD
+                .decode(&cleaned)
+                .map_err(|_| CryptoError::Malformed("recovery key is not valid base64"))?,
+        );
         if raw.len() != RECOVERY_KEY_LEN {
             return Err(CryptoError::Malformed("recovery key must decode to 32 bytes"));
         }
@@ -187,7 +189,7 @@ mod tests {
         assert!(RecoveryKey::from_display("not valid!!").is_err());
         assert!(RecoveryKey::from_display(&"A".repeat(100)).is_err());
         // Valid base64 but wrong length.
-        let short = STANDARD.encode(&[0u8; 16]);
+        let short = STANDARD.encode([0u8; 16]);
         assert!(RecoveryKey::from_display(&short).is_err());
     }
 

@@ -1,5 +1,6 @@
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use zeroize::Zeroize;
 
 use crate::error::CryptoError;
 use crate::keys::{random_bytes, Key32};
@@ -77,11 +78,14 @@ impl Envelope {
     }
 
     pub fn unwrap(&self, key: &Key32, aad: &[u8]) -> Result<Key32, CryptoError> {
-        let plain = open(key, aad, &self.bytes)?;
+        let mut plain = open(key, aad, &self.bytes)?;
         if plain.len() != 32 {
+            plain.zeroize();
             return Err(CryptoError::Malformed("envelope payload must be 32 bytes"));
         }
-        Key32::from_slice(&plain)
+        let out = Key32::from_slice(&plain);
+        plain.zeroize();
+        out
     }
 
     pub fn as_bytes(&self) -> &[u8] {

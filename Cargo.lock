@@ -4974,6 +4974,7 @@ dependencies = [
  "vault-container",
  "vault-core",
  "vault-crypto",
+ "zeroize",
 ]
 
 [[package]]

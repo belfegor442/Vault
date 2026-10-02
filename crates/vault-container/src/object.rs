@@ -285,7 +285,7 @@ mod tests {
             let (_, header, out) = write_then_read(&data);
             assert_eq!(out.len(), size);
             assert_eq!(header.plaintext_len, size as u64);
-            let expected_chunks = if size == 0 { 1 } else { (size as u64 + 1024 * 1024 - 1) / (1024 * 1024) };
+            let expected_chunks = if size == 0 { 1 } else { (size as u64).div_ceil(1024 * 1024) };
             assert_eq!(header.chunk_count, expected_chunks);
         }
     }

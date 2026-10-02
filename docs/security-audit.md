@@ -10,9 +10,10 @@ third-party assessment.
 |---|---|---|
 | Argon2id with validated floors (m ≥ 19456 KiB, t ≥ 2) | `vault-crypto/kdf.rs` | `kdf.rs` tests, header validation |
 | Uniform `AuthFailed` (no wrong-password/tamper oracle) | `header.rs unwrap_root`, engine unlock | `create_lock_unlock_roundtrip`, CLI `wrong_password_is_rejected` |
-| Exponential unlock lockout (5 → 300 s·2^(n−5) ≤ 1 h) | engine `register_failed_attempt` | `repeated_failures_cause_lockout` |
-| Lockdown state machine, CRITICAL only via explicit triggers | `vault-security/lockdown.rs` | 13 security-crate tests |
-| Anti-rollback witness checked on every unlock path | `read_verified_manifest_bytes` | `rollback_of_container_is_detected` |
+| Exponential unlock lockout (5 → 300 s·2^(n−5) ≤ 1 h) | engine `lockout_delay_ms` | `repeated_failures_cause_lockout`, backoff unit tests (cap at 1 h) |
+| Lockdown state machine; tamper rules → LOCKED + session destruction, CRITICAL reserved for operator escalation | `vault-security/lockdown.rs` | security-crate tests (confidence gate, rekey rules, ack edge) |
+| Anti-rollback witness checked on every unlock path (incl. recovery) | `read_verified_manifest_bytes` | `rollback_of_container_is_detected` (also asserts recovery cannot bypass + LOCKED) |
+| Control-state loss loud, not silent | `open()` pending events | `deleted_control_state_raises_control_unavailable` |
 | Hash-chained manifest + `CURRENT` binding | container + engine | blob/CURRENT corruption tests |
 | Tamper-evident audit log (seq+prev-hash AAD) | `audit.rs` | chain/tamper/truncate tests |
 | STREAM chunk AAD binds index/finality/length | `vault-crypto/stream.rs` | reordering/truncation/splice tests |
@@ -25,12 +26,14 @@ third-party assessment.
 | Irreversible erases require password proof | `crypto_erase` | `crypto_erase_scopes`, domain proof test |
 | DPAPI-protected control state, plaintext fallback labeled | `vault-security/control.rs` | control round-trip tests |
 | Hostile-input caps (entry counts, meta size, record sizes, read caps) | manifest/audit/parse paths | malformed-input tests |
-| Strict parsers: reserved bytes, versions, magic, lengths | all container formats | header/manifest/blob negative tests |
-| Passwords never in argv; TTY or env with warning | `vault-cli` | CLI integration tests |
+| Strict parsers: reserved bytes, versions, magic, lengths | all container formats | header/manifest/blob negative tests (incl. reserved0 byte 75, unknown flag bits) |
+| Export refuses in-vault destinations; staging + verify before rename | engine `export_file` | `file_import_export_multi_chunk_roundtrip`, CLI export refusal test |
+| Blob id/version substitution refused | object AAD | `swapped_object_blobs_are_refused` |
+| Passwords never in argv; TTY or env with warning; empty env falls back to TTY | `vault-cli` | CLI integration tests |
 
 ## Test evidence
 
-`cargo test --workspace` — 130 tests: unit (crypto/container/storage/
+`cargo test --workspace` — 141 tests: unit (crypto/container/storage/
 security/recovery/core), end-to-end engine suite, fault-injection crash
 suite (child-process hard-exit at named points), CLI integration suite
 against the real binary.
@@ -47,6 +50,9 @@ against the real binary.
 | F-6 Recovery capability is destroyed by a domain rekey | Info | By design; audited + documented |
 | F-7 `control.unavailable` resets the rollback witness on first load | Low | Accepted; warning + audit event recorded |
 | F-8 Slint UI layer not yet adversarially reviewed | — | Pending (see roadmap) |
+| F-9 `Lockdown::escalate_critical` has no UI/CLI wiring — CRITICAL is unreachable without code changes | Info | Accepted for now; wiring an explicit "declare compromised" surface is pre-1.0 work |
+| F-10 Recovery envelope has no checksum outside the AEAD (garbage key = generic failure) | Info | Accepted; single error class is deliberate (no oracle), format frozen |
+| F-11 Lockdown event log is an in-memory ring (512 events); older entries age out | Info | Accepted; the hash-chained `audit.bin` is the durable record (64 MiB cap) |
 
 ## Dependency audit
 

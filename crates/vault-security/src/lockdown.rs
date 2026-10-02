@@ -120,6 +120,13 @@ pub fn classify(trigger: &Trigger) -> (VaultState, Action) {
         }
         // Rollback / substitution: high confidence, needs re-auth.
         "rollback.detected" => (VaultState::Locked, Action::DestroySession),
+        // Cryptographic failures during a domain-rekey migration: the
+        // password was already verified against the current envelope, so a
+        // failing next-envelope or an unopenable manifest means tampering or
+        // corruption — treat like manifest tampering and drop the session.
+        "rekey.next_auth_failed" | "rekey.manifest_undecryptable" => {
+            (VaultState::Locked, Action::DestroySession)
+        }
         // Object-level auth failure: could be bit-rot on one object.
         // Restrict (quarantine) instead of locking the whole vault.
         "object.auth_failed" => (VaultState::Restricted, Action::RestrictAccess),
@@ -171,14 +178,26 @@ impl Lockdown {
         &self.record.events
     }
 
+    /// Borrow the serializable record (engine persists it at `state/lockdown.json`).
+    pub fn record(&self) -> &LockdownRecord {
+        &self.record
+    }
+
     pub fn into_record(self) -> LockdownRecord {
         self.record
     }
 
     /// Evaluate a trigger: record it, escalate the state (monotonically) and
     /// return the action the engine must apply.
+    ///
+    /// Confidence gate (see `Trigger::confidence`): rules below 50 can never
+    /// escalate beyond `Suspicious`, regardless of what the rule table maps
+    /// them to — uncertain detections must not quarantine the vault.
     pub fn evaluate(&mut self, trigger: Trigger, now_ms: u64) -> Action {
-        let (target, action) = classify(&trigger);
+        let (mut target, action) = classify(&trigger);
+        if trigger.confidence < 50 && target.rank() > VaultState::Suspicious.rank() {
+            target = VaultState::Suspicious;
+        }
         let event = SecurityEvent {
             timestamp_ms: now_ms,
             rule: trigger.rule.to_string(),
@@ -233,9 +252,14 @@ impl Lockdown {
     }
 
     /// Operator acknowledged review of findings → return to NORMAL.
+    ///
+    /// Only valid from `Suspicious` (the diagram's single acknowledge edge):
+    /// `Restricted`/`Locked` require re-authentication first — acknowledging
+    /// straight out of those states would bypass the re-auth requirement —
+    /// and `Critical` requires `resolve_critical`.
     pub fn acknowledge(&mut self, now_ms: u64) {
-        if self.record.state == VaultState::Critical {
-            return; // Critical needs escalate_critical's counterpart: erase or explicit reset.
+        if self.record.state != VaultState::Suspicious {
+            return;
         }
         self.record.state = VaultState::Normal;
         self.record.events.push(SecurityEvent {
@@ -336,5 +360,39 @@ mod tests {
         assert_eq!(ev.timestamp_ms, 42);
         assert_eq!(ev.rule, "object.auth_failed");
         assert_eq!(ev.component, "test");
+    }
+
+    #[test]
+    fn low_confidence_never_exceeds_suspicious() {
+        let mut ld = Lockdown::new();
+        // The rule table maps rollback to LOCKED, but confidence < 50 caps
+        // the escalation at SUSPICIOUS.
+        ld.evaluate(trig("rollback.detected", 40), 1);
+        assert_eq!(ld.state(), VaultState::Suspicious);
+    }
+
+    #[test]
+    fn acknowledge_cannot_bypass_reauth_from_locked() {
+        let mut ld = Lockdown::new();
+        ld.evaluate(trig("rollback.detected", 95), 1);
+        assert_eq!(ld.state(), VaultState::Locked);
+        // Acknowledge straight out of LOCKED must not return to NORMAL.
+        ld.acknowledge(2);
+        assert_eq!(ld.state(), VaultState::Locked);
+        // Re-auth first (→ Suspicious), then acknowledge is allowed.
+        ld.on_successful_auth(3);
+        assert_eq!(ld.state(), VaultState::Suspicious);
+        ld.acknowledge(4);
+        assert_eq!(ld.state(), VaultState::Normal);
+    }
+
+    #[test]
+    fn rekey_failures_lock_and_destroy_session() {
+        let mut ld = Lockdown::new();
+        let act = ld.evaluate(trig("rekey.manifest_undecryptable", 100), 1);
+        assert_eq!(act, Action::DestroySession);
+        assert_eq!(ld.state(), VaultState::Locked);
+        let act = ld.evaluate(trig("rekey.next_auth_failed", 100), 2);
+        assert_eq!(act, Action::DestroySession);
     }
 }

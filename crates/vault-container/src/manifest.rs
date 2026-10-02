@@ -273,8 +273,12 @@ impl Manifest {
         prev_manifest_hash.copy_from_slice(&file_bytes[44..76]);
 
         let prefix = &file_bytes[..PREFIX_LEN];
-        let body = open(meta_key, prefix, &file_bytes[PREFIX_LEN..])?;
-        let mut manifest = Manifest::decode_body(&body)?;
+        let mut body = open(meta_key, prefix, &file_bytes[PREFIX_LEN..])?;
+        let decoded = Manifest::decode_body(&body);
+        // Plaintext manifest body (names, tags, previews) must not linger on
+        // the heap once copied into the typed struct.
+        body.zeroize();
+        let mut manifest = decoded?;
         manifest.generation = generation;
         manifest.committed_at_ms = committed_at_ms;
         manifest.prev_manifest_hash = prev_manifest_hash;

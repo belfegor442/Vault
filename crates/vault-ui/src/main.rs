@@ -11,6 +11,7 @@ use slint::VecModel;
 use vault_container::parse_id_hex;
 use vault_core::{CoreError, CreateOptions, ItemKind, ItemSummary, LockReason, VaultEngine};
 use vault_crypto::{to_hex16, SecretBytes};
+use zeroize::Zeroizing;
 
 type Id = [u8; 16];
 
@@ -211,52 +212,70 @@ fn refresh(ui: &MainWindow, st: &Rc<RefCell<Inner>>) {
 }
 
 fn load_detail(ui: &MainWindow, st: &Rc<RefCell<Inner>>, id: Id, kind: ItemKind, index: i32) {
-    let s = st.borrow();
-    let engine = match s.engine.as_ref() {
-        Some(e) => e,
-        None => return,
-    };
-    match kind {
-        ItemKind::Note => match engine.get_note(&id) {
-            Ok(n) => {
-                ui.set_detail_mode(1);
+    // Load first; only adopt the detail target when the read actually
+    // succeeded — on failure Save/Delete/favorite must not act on an entry
+    // we could not open (the old code set `st.detail` unconditionally).
+    let loaded_ok = {
+        let mut s = st.borrow_mut();
+        let engine = match s.engine.as_mut() {
+            Some(e) => e,
+            None => return,
+        };
+        match kind {
+            ItemKind::Note => match engine.get_note(&id) {
+                Ok(n) => {
+                    ui.set_detail_mode(1);
+                    ui.set_detail_id(to_hex16(&id).into());
+                    ui.set_detail_title(n.title.into());
+                    ui.set_detail_content(n.content.into());
+                    ui.set_detail_favorite(n.favorite);
+                    ui.set_detail_size("".into());
+                    true
+                }
+                Err(e) => {
+                    ui.set_notice(format!("open failed: {e}").into());
+                    false
+                }
+            },
+            ItemKind::Password => match engine.get_password(&id) {
+                Ok(p) => {
+                    ui.set_detail_mode(2);
+                    ui.set_detail_id(to_hex16(&id).into());
+                    ui.set_detail_title(p.name.into());
+                    ui.set_detail_username(p.username.into());
+                    ui.set_detail_secret(p.password.into());
+                    ui.set_detail_url(p.url.into());
+                    ui.set_detail_category(p.category.into());
+                    ui.set_detail_notes(p.notes.into());
+                    ui.set_detail_favorite(p.favorite);
+                    ui.set_detail_size("".into());
+                    true
+                }
+                Err(e) => {
+                    ui.set_notice(format!("open failed: {e}").into());
+                    false
+                }
+            },
+            ItemKind::File => {
+                let size = s.rows.iter().find(|r| r.id == id).map(|r| r.size).unwrap_or(0);
+                ui.set_detail_mode(3);
                 ui.set_detail_id(to_hex16(&id).into());
-                ui.set_detail_title(n.title.into());
-                ui.set_detail_content(n.content.into());
-                ui.set_detail_favorite(n.favorite);
-                ui.set_detail_size("".into());
+                ui.set_detail_title(s.rows.iter().find(|r| r.id == id).map(|r| r.name.clone()).unwrap_or_default().into());
+                ui.set_detail_size(fmt_bytes(size).into());
+                ui.set_detail_favorite(false);
+                true
             }
-            Err(e) => ui.set_notice(format!("open failed: {e}").into()),
-        },
-        ItemKind::Password => match engine.get_password(&id) {
-            Ok(p) => {
-                ui.set_detail_mode(2);
-                ui.set_detail_id(to_hex16(&id).into());
-                ui.set_detail_title(p.name.into());
-                ui.set_detail_username(p.username.into());
-                ui.set_detail_secret(p.password.into());
-                ui.set_detail_url(p.url.into());
-                ui.set_detail_category(p.category.into());
-                ui.set_detail_notes(p.notes.into());
-                ui.set_detail_favorite(p.favorite);
-                ui.set_detail_size("".into());
-            }
-            Err(e) => ui.set_notice(format!("open failed: {e}").into()),
-        },
-        ItemKind::File => {
-            let size = s.rows.iter().find(|r| r.id == id).map(|r| r.size).unwrap_or(0);
-            ui.set_detail_mode(3);
-            ui.set_detail_id(to_hex16(&id).into());
-            ui.set_detail_title(s.rows.iter().find(|r| r.id == id).map(|r| r.name.clone()).unwrap_or_default().into());
-            ui.set_detail_size(fmt_bytes(size).into());
-            ui.set_detail_favorite(false);
         }
+    };
+    if loaded_ok {
+        ui.set_selected_index(index);
+        st.borrow_mut().detail = Detail::Edit(kind, id);
+    } else {
+        // Failed open: reset the selection target instead of leaving the
+        // previous entry's detail armed under a new list selection.
+        clear_detail(ui);
+        st.borrow_mut().detail = Detail::None;
     }
-    ui.set_selected_index(index);
-    drop(s);
-    // st.detail must be set after drop (we only needed reads)
-    let mut s = st.borrow_mut();
-    s.detail = Detail::Edit(kind, id);
 }
 
 fn build_status(ui: &MainWindow, st: &Rc<RefCell<Inner>>) {
@@ -323,11 +342,12 @@ fn main() -> Result<(), slint::PlatformError> {
         let st = st.clone();
         ui.on_unlock_requested(move |pw| {
             let ui = ui_weak.unwrap();
+            let pw = Zeroizing::new(pw.to_string());
             let mut s = st.borrow_mut();
             let dir = PathBuf::from(ui.get_dir_text().to_string());
             s.dir = dir.clone();
             let result = VaultEngine::open(&dir).and_then(|mut e| {
-                e.unlock(&SecretBytes::from_str(pw.as_ref()))?;
+                e.unlock(&SecretBytes::from_str(pw.as_str()))?;
                 Ok(e)
             });
             match result {
@@ -337,6 +357,9 @@ fn main() -> Result<(), slint::PlatformError> {
                     s.folder = None;
                     s.query = String::new();
                     drop(s);
+                    // wipe the password field so the secret does not linger
+                    // in the Slint widget after a successful unlock
+                    ui.set_pass("".into());
                     ui.set_error_text("".into());
                     ui.set_notice("".into());
                     ui.set_filter(0);
@@ -355,13 +378,13 @@ fn main() -> Result<(), slint::PlatformError> {
         let st = st.clone();
         ui.on_create_requested(move |pw, confirm, with_recovery| {
             let ui = ui_weak.unwrap();
-            let pw = pw.to_string();
-            let confirm = confirm.to_string();
+            let pw = Zeroizing::new(pw.to_string());
+            let confirm = Zeroizing::new(confirm.to_string());
             if pw.len() < 8 {
                 ui.set_error_text("password must be at least 8 characters".into());
                 return;
             }
-            if pw != confirm {
+            if pw.as_str() != confirm.as_str() {
                 ui.set_error_text("passwords do not match".into());
                 return;
             }
@@ -369,10 +392,12 @@ fn main() -> Result<(), slint::PlatformError> {
             let dir = PathBuf::from(ui.get_dir_text().to_string());
             s.dir = dir.clone();
             let opts = CreateOptions { kdf: None, with_recovery };
-            match VaultEngine::create(&dir, &SecretBytes::from_str(&pw), opts) {
+            match VaultEngine::create(&dir, &SecretBytes::from_str(pw.as_str()), opts) {
                 Ok((engine, recovery)) => {
                     s.engine = Some(engine);
                     drop(s);
+                    ui.set_pass("".into());
+                    ui.set_pass_confirm("".into());
                     ui.set_error_text("".into());
                     ui.set_notice(match recovery {
                         Some(r) => format!("Vault created. Recovery key (write it down, shown once): {r}"),
@@ -391,8 +416,8 @@ fn main() -> Result<(), slint::PlatformError> {
         let st = st.clone();
         ui.on_recover_requested(move |key, new_pw| {
             let ui = ui_weak.unwrap();
-            let key = key.to_string();
-            let new_pw = new_pw.to_string();
+            let key = Zeroizing::new(key.to_string());
+            let new_pw = Zeroizing::new(new_pw.to_string());
             if new_pw.len() < 8 {
                 ui.set_error_text("new password must be at least 8 characters".into());
                 return;
@@ -401,7 +426,7 @@ fn main() -> Result<(), slint::PlatformError> {
             let dir = PathBuf::from(ui.get_dir_text().to_string());
             s.dir = dir.clone();
             let result = VaultEngine::open(&dir).and_then(|mut e| {
-                e.unlock_with_recovery(key.trim(), &SecretBytes::from_str(&new_pw))?;
+                e.unlock_with_recovery(key.as_str().trim(), &SecretBytes::from_str(new_pw.as_str()))?;
                 Ok(e)
             });
             match result {
@@ -411,6 +436,8 @@ fn main() -> Result<(), slint::PlatformError> {
                     s.folder = None;
                     s.query = String::new();
                     drop(s);
+                    ui.set_rec_key("".into());
+                    ui.set_rec_pass("".into());
                     ui.set_error_text("".into());
                     ui.set_notice("Vault recovered; master password has been reset.".into());
                     ui.set_filter(0);
@@ -454,6 +481,10 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_items(Rc::new(VecModel::from(Vec::<ItemRow>::new())).into());
             ui.set_folders(Rc::new(VecModel::from(Vec::<FolderRow>::new())).into());
             clear_detail(&ui);
+            // The unlock screen must return to plain password mode — without
+            // this, locking from the main screen left auth_mode on
+            // create/recover and the unlock button submitted the wrong form.
+            ui.set_auth_mode(0);
             ui.set_screen(0);
         });
     }
@@ -472,6 +503,9 @@ fn main() -> Result<(), slint::PlatformError> {
         let st = st.clone();
         ui.on_back_requested(move || {
             let ui = ui_weak.unwrap();
+            // Leaving the status/detail surface must not carry the previous
+            // notice (e.g. "Save failed …") into the list view forever.
+            ui.set_notice("".into());
             ui.set_screen(1);
             refresh(&ui, &st);
         });
@@ -698,6 +732,11 @@ fn main() -> Result<(), slint::PlatformError> {
                         .unwrap_or(-1);
                     if idx >= 0 {
                         load_detail(&ui, &st, id, kind, idx);
+                    } else {
+                        // Entry left the (filtered) list — the detail pane
+                        // must not keep showing a stale target.
+                        clear_detail(&ui);
+                        st.borrow_mut().detail = Detail::None;
                     }
                 }
                 Err(e) => {

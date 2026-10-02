@@ -260,7 +260,7 @@ mod tests {
             let expected_chunks = if size == 0 {
                 1
             } else {
-                ((size + CHUNK_SIZE - 1) / CHUNK_SIZE) as u64
+                size.div_ceil(CHUNK_SIZE) as u64
             };
             assert_eq!(st.chunk_count, expected_chunks);
         }

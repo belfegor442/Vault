@@ -127,13 +127,25 @@ impl VaultHeader {
         self.to_bytes()[..RECOVERY_AAD_LEN].to_vec()
     }
 
+    /// HKDF context for the recovery KEK: `vault_id || recovery_salt`.
+    /// Both `enable_recovery` and `unwrap_root_with_recovery` must derive
+    /// with the same context or the envelope will not open.
+    fn recovery_kek_ctx(&self) -> [u8; 48] {
+        let mut ctx = [0u8; 48];
+        ctx[..16].copy_from_slice(&self.vault_id);
+        ctx[16..].copy_from_slice(&self.recovery_salt);
+        ctx
+    }
+
     /// Attach a recovery envelope wrapping `root_key`.
     pub fn enable_recovery(&mut self, root_key: &Key32, recovery_key: &Key32) {
         self.recovery_salt = vault_crypto::random_bytes();
         self.flags |= FLAG_RECOVERY;
         // Recovery keys are 256-bit CSPRNG output (not human passwords), so a
-        // direct HKDF derivation — not Argon2id — is correct here.
-        let kek = recovery_key.derive_labeled(b"vault:recovery-kek:v1", &self.vault_id);
+        // direct HKDF derivation — not Argon2id — is correct here. The KEK is
+        // salted per-vault *and* per issuance (`recovery_salt`), so re-issuing
+        // a recovery key derives a different KEK even under the same key.
+        let kek = recovery_key.derive_labeled(b"vault:recovery-kek:v1", &self.recovery_kek_ctx());
         let aad = self.recovery_aad_prefix();
         let env = Envelope::wrap(&kek, &aad, root_key);
         self.recovery_nonce.copy_from_slice(&env.bytes[..NONCE_LEN]);
@@ -176,6 +188,18 @@ impl VaultHeader {
         next_root: &Key32,
     ) -> Result<(), ContainerError> {
         next_kdf.validate()?;
+        // Only the salt may change: weakening Argon2 cost parameters during a
+        // rekey (or arming with different ones than the current header) would
+        // silently downgrade the master-password KDF.
+        if next_kdf.algorithm != self.kdf.algorithm
+            || next_kdf.memory_kib != self.kdf.memory_kib
+            || next_kdf.iterations != self.kdf.iterations
+            || next_kdf.parallelism != self.kdf.parallelism
+        {
+            return Err(ContainerError::Malformed(
+                "rekey must not change KDF cost parameters",
+            ));
+        }
         if self.rekey_state != REKEY_STATE_NONE {
             return Err(ContainerError::Malformed("domain rekey already pending"));
         }
@@ -247,7 +271,7 @@ impl VaultHeader {
         if !self.has_recovery() {
             return Err(ContainerError::Malformed("recovery envelope absent"));
         }
-        let kek = recovery_key.derive_labeled(b"vault:recovery-kek:v1", &self.vault_id);
+        let kek = recovery_key.derive_labeled(b"vault:recovery-kek:v1", &self.recovery_kek_ctx());
         let mut sealed = [0u8; NONCE_LEN + ENVELOPE_LEN];
         sealed[..NONCE_LEN].copy_from_slice(&self.recovery_nonce);
         sealed[NONCE_LEN..].copy_from_slice(&self.recovery_envelope);
@@ -337,11 +361,15 @@ impl VaultHeader {
         if kdf_id != KDF_ARGON2ID {
             return Err(ContainerError::Malformed("unknown kdf id"));
         }
-        if bytes[OFF_RESERVED0] != 0 {
+        if bytes[OFF_RESERVED0..OFF_FLAGS].iter().any(|&b| b != 0) {
             return Err(ContainerError::Malformed("nonzero reserved0"));
         }
         if bytes[OFF_RESERVED..].iter().any(|&b| b != 0) {
             return Err(ContainerError::Malformed("nonzero reserved region"));
+        }
+        let flags = u16::from_le_bytes(bytes[OFF_FLAGS..OFF_FLAGS + 2].try_into().unwrap());
+        if flags & !FLAG_RECOVERY != 0 {
+            return Err(ContainerError::Malformed("unknown flag bits set"));
         }
         let rekey_state = bytes[OFF_REKEY_STATE];
         if rekey_state != REKEY_STATE_NONE && rekey_state != REKEY_STATE_PENDING {
@@ -361,7 +389,6 @@ impl VaultHeader {
 
         let mut vault_id = [0u8; 16];
         vault_id.copy_from_slice(&bytes[OFF_VAULT_ID..OFF_VAULT_ID + 16]);
-        let flags = u16::from_le_bytes(bytes[OFF_FLAGS..OFF_FLAGS + 2].try_into().unwrap());
         let kdf = KdfParams {
             algorithm: kdf_id,
             memory_kib: u32::from_le_bytes(bytes[OFF_MEMORY..OFF_MEMORY + 4].try_into().unwrap()),
@@ -686,5 +713,41 @@ mod tests {
         let mut bad = bytes;
         bad[OFF_REKEY_STATE] = REKEY_STATE_PENDING;
         assert!(VaultHeader::parse(&bad).is_err());
+    }
+
+    #[test]
+    fn second_reserved0_byte_must_be_zero() {
+        let (hdr, _) = make_header("pw");
+        let mut bytes = hdr.to_bytes();
+        bytes[OFF_RESERVED0 + 1] = 1; // byte 75 — half of the 2-byte reserved0
+        assert!(VaultHeader::parse(&bytes).is_err());
+    }
+
+    #[test]
+    fn unknown_flag_bits_rejected() {
+        let (hdr, _) = make_header("pw");
+
+        // High byte: flag bit 15.
+        let mut bytes = hdr.to_bytes();
+        bytes[OFF_FLAGS + 1] |= 0x80;
+        assert!(VaultHeader::parse(&bytes).is_err());
+
+        // Low byte: flag bit 7 (only bit 0 = recovery is defined).
+        let mut bytes = hdr.to_bytes();
+        bytes[OFF_FLAGS] |= 0x02;
+        assert!(VaultHeader::parse(&bytes).is_err());
+    }
+
+    #[test]
+    fn arm_rekey_rejects_kdf_cost_change() {
+        let pw = SecretBytes::from_str("pw");
+        let (mut hdr, _) = make_header("pw");
+        let mut next_kdf = test_kdf();
+        next_kdf.iterations += 1; // cost params must not change during rekey
+        assert!(hdr.arm_rekey(&pw, next_kdf, &Key32::random()).is_err());
+        // Same KDF params (fresh salt) are fine.
+        let mut ok_kdf = test_kdf();
+        ok_kdf.salt = [77u8; 32];
+        assert!(hdr.arm_rekey(&pw, ok_kdf, &Key32::random()).is_ok());
     }
 }

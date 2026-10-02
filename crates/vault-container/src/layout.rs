@@ -9,7 +9,8 @@
 //! ├── objects/
 //! │   └── <xx>/<hex-id>        encrypted object blobs
 //! ├── state/
-//! │   └── ctl.bin              machine-bound control state (throttle, rollback witness)
+//! │   ├── ctl.bin              machine-bound control state (throttle, rollback witness)
+//! │   └── lockdown.json         persisted lockdown state (security events)
 //! └── audit/
 //!     └── audit.bin            encrypted, hash-chained security event log
 //! ```
@@ -80,6 +81,11 @@ impl Layout {
 
     pub fn control_file(&self) -> PathBuf {
         self.state_dir().join(CONTROL_FILE)
+    }
+
+    /// Persisted lockdown state (see `docs/threat-model.md` §Lockdown).
+    pub fn lockdown_file(&self) -> PathBuf {
+        self.state_dir().join("lockdown.json")
     }
 
     pub fn audit_dir(&self) -> PathBuf {

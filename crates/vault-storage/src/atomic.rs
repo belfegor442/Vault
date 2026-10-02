@@ -25,12 +25,23 @@ use std::path::{Path, PathBuf};
 use rand::RngCore;
 
 /// Hard-exit at a named fault point when the environment requests it.
+///
+/// Debug builds only: crash tests run under `cargo test` (debug profile), so
+/// release binaries never honor `VAULT_FAULT_POINT` — a leftover environment
+/// variable cannot crash a production build.
 pub fn fault_point(name: &str) {
-    if let Ok(want) = std::env::var("VAULT_FAULT_POINT") {
-        if want == name {
-            // Deliberately skips destructors: this simulates a crash.
-            std::process::exit(9);
+    #[cfg(debug_assertions)]
+    {
+        if let Ok(want) = std::env::var("VAULT_FAULT_POINT") {
+            if want == name {
+                // Deliberately skips destructors: this simulates a crash.
+                std::process::exit(9);
+            }
         }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = name;
     }
 }
 
@@ -97,16 +108,24 @@ fn sync_dir(dir: &Path) {
 }
 
 /// Read a whole file with a hard size cap (hostile input guard).
+///
+/// The cap is enforced on the *read* stream (`take(cap + 1)`), not on a
+/// separate `metadata` call, so a file swapped in between the stat and the
+/// open cannot exceed the cap (TOCTOU-safe). The initial `with_capacity` is
+/// bounded by `cap`, not by the (attacker-controlled) claimed length.
 pub fn read_file_capped(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
-    let meta = fs::metadata(path)?;
-    if meta.len() > cap {
+    let mut out = Vec::with_capacity((8 * 1024).min(cap) as usize);
+    let file = File::open(path)?;
+    let allowed = cap.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "size cap overflow")
+    })?;
+    let n = file.take(allowed).read_to_end(&mut out)?;
+    if (n as u64) > cap {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "file exceeds size cap",
         ));
     }
-    let mut out = Vec::with_capacity(meta.len() as usize);
-    File::open(path)?.read_to_end(&mut out)?;
     Ok(out)
 }
 
@@ -118,19 +137,39 @@ pub fn cleanup_temp_files(dir: &Path) -> std::io::Result<usize> {
     Ok(cleanup_temp_files_depth(dir, 4))
 }
 
+/// Only files matching Vault's own temp naming (`<name>.<32-hex>.tmp`, see
+/// `temp_path_for`) are removed — an unrelated `foo.tmp` the user keeps in a
+/// vault folder must survive. Symlinks are never followed or removed.
+fn is_vault_temp_name(name: &str) -> bool {
+    let Some(stripped) = name.strip_suffix(".tmp") else {
+        return false;
+    };
+    let Some((stem, suffix)) = stripped.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty() && suffix.len() == 32 && suffix.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 fn cleanup_temp_files_depth(dir: &Path, depth: usize) -> usize {
     let mut removed = 0;
     let Ok(entries) = fs::read_dir(dir) else {
         return 0;
     };
     for entry in entries.flatten() {
+        // Never follow (or delete through) symlinks.
+        let Ok(md) = fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if md.is_symlink() {
+            continue;
+        }
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.ends_with(".tmp") {
-            if fs::remove_file(entry.path()).is_ok() {
+        if md.is_file() {
+            if is_vault_temp_name(&name) && fs::remove_file(entry.path()).is_ok() {
                 removed += 1;
             }
-        } else if depth > 0 && entry.path().is_dir() {
+        } else if md.is_dir() && depth > 0 {
             removed += cleanup_temp_files_depth(&entry.path(), depth - 1);
         }
     }
@@ -190,13 +229,17 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_removes_only_tmp_files() {
+    fn cleanup_removes_only_vault_temp_files() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("keep.bin"), b"k").unwrap();
-        fs::write(dir.path().join("x.abc.tmp"), b"t").unwrap();
+        fs::write(dir.path().join("keep.tmp"), b"user file").unwrap();
+        let suffix = "0123456789abcdef0123456789abcdef";
+        fs::write(dir.path().join(format!("a.bin.{}.tmp", suffix)), b"t").unwrap();
         let n = cleanup_temp_files(dir.path()).unwrap();
         assert_eq!(n, 1);
         assert!(dir.path().join("keep.bin").exists());
-        assert!(!dir.path().join("x.abc.tmp").exists());
+        // Unrelated *.tmp files are the user's data, not ours: kept.
+        assert!(dir.path().join("keep.tmp").exists());
+        assert!(!dir.path().join(format!("a.bin.{}.tmp", suffix)).exists());
     }
 }
