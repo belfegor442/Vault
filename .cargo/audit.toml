@@ -1,0 +1,17 @@
+# RustSec audit configuration.
+#
+# `cargo audit` fails (non-zero exit) only on real *vulnerabilities*.
+# The entries under `[advisories] ignore` are informational warnings we
+# have reviewed and accepted — see docs/security-audit.md "Findings".
+# Both are `unmaintained` advisories on transitive Slint dependencies
+# that never touch vault secrets or container bytes.
+
+[advisories]
+ignore = [
+    # bincode 2.0.1 — unmaintained (RUSTSEC-2025-0141). Build-time only,
+    # via typed-index-collections -> i-slint-compiler.
+    "RUSTSEC-2025-0141",
+    # ttf-parser 0.25.1 — unmaintained (RUSTSEC-2026-0192). Font
+    # rasterization for the UI, no secret access.
+    "RUSTSEC-2026-0192",
+]

@@ -26,7 +26,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Dependency audit (RustSec)
-        uses: rustsec/audit-check@v2.0.0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo-audit
+        uses: Swatinem/rust-cache@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          key: cargo-audit
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      # `cargo audit` exits non-zero only on real vulnerabilities. Accepted
+      # informational warnings are listed in `.cargo/audit.toml` (see
+      # docs/security-audit.md). This replaces rustsec/audit-check, which
+      # fails the job on unmaintained notices even with zero vulnerabilities.
+      - name: Dependency audit (RustSec)
+        run: cargo audit

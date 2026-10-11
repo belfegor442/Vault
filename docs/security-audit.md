@@ -56,19 +56,21 @@ against the real binary.
 
 ## Dependency audit
 
-`cargo audit` (RustSec advisory DB, 1279 advisories, 608 locked
-dependencies) run 2026-10-01:
+`cargo audit` (RustSec advisory DB, ~1290 advisories, 608 locked
+dependencies) run 2026-10-04:
 
 - **0 known vulnerabilities.**
 - 2 *unmaintained* warnings, both transitive UI-stack dependencies that
-  never see vault secrets or container bytes:
+  never see vault secrets or container bytes — accepted and listed in
+  `.cargo/audit.toml` (`[advisories] ignore`):
   - `bincode 2.0.1` (RUSTSEC-2025-0141) ← `typed-index-collections` ←
     `i-slint-compiler` (build-time Slint compiler only).
   - `ttf-parser 0.25.1` (RUSTSEC-2026-0192) ← `ab_glyph` ← `winit`/`sctk-adwaita`
     (font rasterization for the UI).
 
 Accepted: replacing either would require forking Slint's dependency tree;
-monitored via the CI audit job.
+monitored via the CI audit job (`cargo audit` fails only on real
+vulnerabilities, not on accepted informational warnings).
 
 ## Residual engineering work before a real audit
 
@@ -78,4 +80,5 @@ monitored via the CI audit job.
    AEAD failure for secrets; explicit `ct_eq` for remaining byte compares).
 3. Fuzzing targets for header/manifest/blob/audit parsers (`cargo-fuzz`).
 4. ~~Dependency audit (`cargo audit`) in CI.~~ Done: `.github/workflows/ci.yml`
-   runs `rustsec/audit-check` on every push/PR.
+   runs `cargo audit` on every push/PR (fails only on real vulnerabilities;
+   accepted unmaintained notices are ignored via `.cargo/audit.toml`).
